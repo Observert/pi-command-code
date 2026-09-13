@@ -1,0 +1,65 @@
+{
+  "name": "pi-command-code",
+  "version": "1.0.0",
+  "description": "Command Code Provider API for Pi — every top model (Claude, GPT, Gemini, DeepSeek, Kimi, GLM, Qwen, Grok & more) behind one OpenAI- or Anthropic-compatible endpoint, with the live model catalog discovered automatically at startup.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "provider",
+    "command-code",
+    "commandcode",
+    "anthropic",
+    "openai",
+    "claude",
+    "gpt",
+    "gemini",
+    "deepseek",
+    "llm",
+    "ai"
+  ],
+  "license": "MIT",
+  "author": "Observert",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Observert/pi-command-code.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Observert/pi-command-code/issues"
+  },
+  "homepage": "https://github.com/Observert/pi-command-code#readme",
+  "files": [
+    "index.ts",
+    "rates.ts",
+    "scripts/refresh-rates.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test",
+    "typecheck": "tsc --noEmit",
+    "refresh-rates": "node scripts/refresh-rates.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^7.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ]
+}
