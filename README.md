@@ -186,6 +186,7 @@ Note that `/provider/v1/models` is a **public** endpoint: it returns HTTP 200 ev
 - **Cost is a published list rate, not a billed amount.** Bundled for all 69 models; override with `COMMANDCODE_RATES`. See [Cost tracking](#cost-tracking).
 - **`maxTokens` is `32768` by default.** The catalog does not report output caps and pi requires a value, so this is a conservative floor. Raise it with `COMMANDCODE_MAX_TOKENS`.
 - **Reasoning is registered for Claude models only.** That is where the flag is known to be meaningful on this endpoint; other families register as non-reasoning.
+- **Claude thinking uses the adaptive shape.** Claude 5.x and 4.7+ reject `thinking.type: "enabled"`, so those models set `compat.forceAdaptiveThinking`. `claude-haiku-4-5-20251001` is the one model that rejects adaptive and keeps the legacy shape. A future model with different requirements would need a code change, not just a catalog refresh.
 - **Text and images only.** Command Code's schema rejects audio, file and document parts. Some catalog models are text-only and will error upstream if sent images.
 - If the catalog fetch fails, the extension logs a warning and registers nothing rather than blocking pi startup. Fix the cause and `/reload`.
 
@@ -193,7 +194,7 @@ Note that `/provider/v1/models` is a **public** endpoint: it returns HTTP 200 ev
 
 ```bash
 npm install
-npm test        # 23 tests
+npm test        # 24 tests
 npm run typecheck
 ```
 

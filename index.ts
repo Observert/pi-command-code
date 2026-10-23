@@ -51,6 +51,14 @@ export const MODELS_URL = `${openaiBaseUrl()}/models`;
  */
 export const isAnthropicModel = (id: string) => id.startsWith("claude-");
 
+/**
+ * Claude 5.x and 4.7+ reject `thinking.type: "enabled"` and require the
+ * adaptive shape. The 4.5 haiku is the exception: it rejects "adaptive".
+ * pi only sends adaptive when the model sets `compat.forceAdaptiveThinking`.
+ */
+export const needsLegacyThinking = (id: string) =>
+  id === "claude-haiku-4-5-20251001";
+
 export interface RemoteModel {
   id: string;
   name?: string;
@@ -247,6 +255,9 @@ export function toModelConfig(
     // differing baseUrl each SDK expects.
     api: anthropic ? "anthropic-messages" : "openai-completions",
     baseUrl: anthropic ? anthropicBaseUrl() : openaiBaseUrl(),
+    ...(anthropic && !needsLegacyThinking(m.id)
+      ? { compat: { forceAdaptiveThinking: true } }
+      : {}),
   };
 }
 

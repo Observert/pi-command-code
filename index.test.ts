@@ -36,6 +36,35 @@ test("claude models route to the Anthropic messages endpoint", () => {
   );
 });
 
+test("claude models use adaptive thinking, except the 4.5 haiku", () => {
+  for (const id of [
+    "claude-sonnet-5-5",
+    "claude-opus-5",
+    "claude-opus-4-7",
+    "claude-fable-5",
+    "claude-sonnet-4-6",
+  ]) {
+    const cfg = toModelConfig({ id }, DEFAULT_MAX_TOKENS);
+    assert.equal(
+      cfg.compat?.forceAdaptiveThinking,
+      true,
+      `${id} needs adaptive thinking`,
+    );
+  }
+
+  const legacy = toModelConfig(
+    { id: "claude-haiku-4-5-20251001" },
+    DEFAULT_MAX_TOKENS,
+  );
+  assert.equal(legacy.compat, undefined, "4.5 haiku rejects adaptive thinking");
+
+  // Non-Claude models are unaffected.
+  assert.equal(
+    toModelConfig({ id: "deepseek/deepseek-v4-pro" }, DEFAULT_MAX_TOKENS).compat,
+    undefined,
+  );
+});
+
 test("non-claude models route to the OpenAI chat completions endpoint", () => {
   for (const id of [
     "deepseek/deepseek-v4-flash",
