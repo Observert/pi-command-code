@@ -58,11 +58,52 @@ test("claude models use adaptive thinking, except the 4.5 haiku", () => {
   );
   assert.equal(legacy.compat, undefined, "4.5 haiku rejects adaptive thinking");
 
-  // Non-Claude models are unaffected.
-  assert.equal(
+  // Non-Claude models get the OpenAI effort knob instead of the adaptive shape.
+  assert.deepEqual(
     toModelConfig({ id: "deepseek/deepseek-v4-pro" }, DEFAULT_MAX_TOKENS).compat,
-    undefined,
+    { supportsReasoningEffort: true, thinkingFormat: "openai" },
   );
+});
+
+test("every family registers as reasoning, with the matching compat", () => {
+  for (const id of [
+    "claude-sonnet-5-5",
+    "claude-haiku-4-5-20251001",
+    "gpt-6-astra",
+    "gpt-5.4",
+    "google/gemini-4-argon",
+    "deepseek/deepseek-v4.1-flash",
+    "moonshotai/Kimi-K3.1-Pro",
+    "z-ai/glm-5.3-flashx",
+    "minimax/minimax-m3.1-flash",
+    "xai/grok-4.7",
+    "mistral/mistral-large-4",
+    "Qwen/Qwen3.8-Max",
+    "nvidia/nemotron-3.5-super-vl",
+    "stealth/glyph-cluster:free",
+    "some/unknown-model",
+  ]) {
+    const cfg = toModelConfig({ id }, DEFAULT_MAX_TOKENS);
+    assert.equal(cfg.reasoning, true, `${id} should register as reasoning`);
+    if (isAnthropicModel(id)) {
+      assert.equal(
+        cfg.compat?.supportsReasoningEffort,
+        undefined,
+        `${id} must not send OpenAI reasoning_effort`,
+      );
+    } else {
+      assert.equal(
+        cfg.compat?.supportsReasoningEffort,
+        true,
+        `${id} needs supportsReasoningEffort or pi sends no effort`,
+      );
+      assert.equal(
+        cfg.compat?.forceAdaptiveThinking,
+        undefined,
+        `${id} is not an Anthropic model`,
+      );
+    }
+  }
 });
 
 test("non-claude models route to the OpenAI chat completions endpoint", () => {
@@ -131,7 +172,7 @@ test("catalog metadata maps through with sane fallbacks", () => {
   assert.equal(bare.name, "some/model"); // name falls back to id
   assert.ok(bare.contextWindow > 0);
   assert.equal(bare.maxTokens, DEFAULT_MAX_TOKENS);
-  assert.equal(bare.reasoning, false);
+  assert.equal(bare.reasoning, true);
 });
 
 test("maxTokens is injectable so users can raise it", () => {
@@ -217,7 +258,7 @@ test("bundled list rates ship for the whole catalog", () => {
     cacheWrite: 3.75,
   });
   // Free-tier models are legitimately $0, not missing.
-  assert.deepEqual(BUNDLED_RATES.get("meituan/LongCat-2.0:free"), {
+  assert.deepEqual(BUNDLED_RATES.get("stealth/glyph-cluster:free"), {
     input: 0,
     output: 0,
     cacheRead: 0,

@@ -59,6 +59,31 @@ export const isAnthropicModel = (id: string) => id.startsWith("claude-");
 export const needsLegacyThinking = (id: string) =>
   id === "claude-haiku-4-5-20251001";
 
+/**
+ * How this endpoint exposes extended thinking.
+ *
+ * Claude takes the adaptive shape (except the 4.5 haiku). Everything else is
+ * OpenAI-compatible and accepts `reasoning_effort`; without
+ * `supportsReasoningEffort`, pi sends no effort at all and the thinking UI
+ * would be a lie.
+ */
+function thinkingCompat(id: string): {
+  compat?: {
+    forceAdaptiveThinking?: boolean;
+    supportsReasoningEffort?: boolean;
+    thinkingFormat?: string;
+  };
+} {
+  if (isAnthropicModel(id)) {
+    return needsLegacyThinking(id)
+      ? {}
+      : { compat: { forceAdaptiveThinking: true } };
+  }
+  return {
+    compat: { supportsReasoningEffort: true, thinkingFormat: "openai" },
+  };
+}
+
 export interface RemoteModel {
   id: string;
   name?: string;
@@ -244,8 +269,9 @@ export function toModelConfig(
   return {
     id: m.id,
     name: m.name ?? m.id,
-    // Claude on this endpoint supports extended thinking.
-    reasoning: anthropic,
+    // Every family here accepts reasoning_effort, and Claude takes extended
+    // thinking through the adaptive shape, so all models can think.
+    reasoning: true,
     input: ["text", "image"] as ("text" | "image")[],
     // Bundled Command Code list rates, unless COMMANDCODE_RATES overrides them.
     cost: resolveCost(m.id, costs),
@@ -255,9 +281,7 @@ export function toModelConfig(
     // differing baseUrl each SDK expects.
     api: anthropic ? "anthropic-messages" : "openai-completions",
     baseUrl: anthropic ? anthropicBaseUrl() : openaiBaseUrl(),
-    ...(anthropic && !needsLegacyThinking(m.id)
-      ? { compat: { forceAdaptiveThinking: true } }
-      : {}),
+    ...thinkingCompat(m.id),
   };
 }
 

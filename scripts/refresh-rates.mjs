@@ -139,13 +139,23 @@ async function main() {
   ]);
   const nameToId = new Map(catalog.map((m) => [m.name, m.id]));
 
-  const entries = [];
+  const byId = new Map();
+  const duplicates = [];
   const missing = [];
   for (const row of pricing) {
     const id = nameToId.get(row.name);
     if (!id) continue; // pricing row for a model no longer offered
-    entries.push({ id, ...row });
+    const seen = byId.get(id);
+    if (seen) {
+      // A free-tier row and a paid row can share one display name. Keep the
+      // paid row: a $0 entry would silently report a paid model as free.
+      duplicates.push(id);
+      if (seen.input === 0 && row.input > 0) byId.set(id, { id, ...row });
+      continue;
+    }
+    byId.set(id, { id, ...row });
   }
+  const entries = [...byId.values()];
   for (const m of catalog) {
     if (!pricing.some((p) => p.name === m.name)) missing.push(m.name);
   }
@@ -164,6 +174,12 @@ async function main() {
   console.error(
     `pricing rows: ${pricing.length} | catalog: ${catalog.length} | matched: ${entries.length}`,
   );
+  if (duplicates.length) {
+    console.error(
+      `NOTE: ${duplicates.length} model id(s) had more than one pricing row; kept the paid row:`,
+    );
+    console.error("  " + duplicates.join("\n  "));
+  }
   if (missing.length) {
     console.error(
       `WARNING: ${missing.length} catalog model(s) have no pricing row:`,

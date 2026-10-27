@@ -183,9 +183,10 @@ Note that `/provider/v1/models` is a **public** endpoint: it returns HTTP 200 ev
 
 ## Notes and limitations
 
-- **Cost is a published list rate, not a billed amount.** Bundled for all 69 models; override with `COMMANDCODE_RATES`. See [Cost tracking](#cost-tracking).
+- **Cost is a published list rate, not a billed amount.** Bundled for all 94 models; override with `COMMANDCODE_RATES`. See [Cost tracking](#cost-tracking).
 - **`maxTokens` is `32768` by default.** The catalog does not report output caps and pi requires a value, so this is a conservative floor. Raise it with `COMMANDCODE_MAX_TOKENS`.
-- **Reasoning is registered for Claude models only.** That is where the flag is known to be meaningful on this endpoint; other families register as non-reasoning.
+- **Every model registers as reasoning.** Claude takes extended thinking through `compat.forceAdaptiveThinking`; every other family is OpenAI-compatible and sets `compat.supportsReasoningEffort`, so pi sends `reasoning_effort`. Verified against the live API: all families accept `reasoning_effort: "max"` with HTTP 200 — models that do not think ignore it rather than rejecting it.
+- **Thinking levels above `high` need an override.** No `thinkingLevelMap` is registered, so pi clamps `xhigh` and `max` to `high` for the OpenAI-shaped families. To send the full range, add a `modelOverrides` entry in `~/.pi/agent/models.json` with a `thinkingLevelMap` for that model id.
 - **Claude thinking uses the adaptive shape.** Claude 5.x and 4.7+ reject `thinking.type: "enabled"`, so those models set `compat.forceAdaptiveThinking`. `claude-haiku-4-5-20251001` is the one model that rejects adaptive and keeps the legacy shape. A future model with different requirements would need a code change, not just a catalog refresh.
 - **Text and images only.** Command Code's schema rejects audio, file and document parts. Some catalog models are text-only and will error upstream if sent images.
 - If the catalog fetch fails, the extension logs a warning and registers nothing rather than blocking pi startup. Fix the cause and `/reload`.
@@ -194,11 +195,11 @@ Note that `/provider/v1/models` is a **public** endpoint: it returns HTTP 200 ev
 
 ```bash
 npm install
-npm test        # 24 tests
+npm test        # 25 tests
 npm run typecheck
 ```
 
-Tests cover the routing rules that make this package work (Claude → Anthropic shape, everything else → OpenAI shape, the two baseUrls staying distinct, the `/v1/v1` regression), cross-platform config parsing, ZDR opt-in handling, cost-rate parsing and precedence, and plan-error classification.
+Tests cover the routing rules that make this package work (Claude → Anthropic shape, everything else → OpenAI shape, the two baseUrls staying distinct, the `/v1/v1` regression), the per-family thinking shape, cross-platform config parsing, ZDR opt-in handling, cost-rate parsing and precedence, and plan-error classification.
 
 ## License
 
