@@ -23,8 +23,8 @@ Add that to your shell profile to persist it. On Windows, use `setx COMMANDCODE_
 ## Usage
 
 ```bash
-pi --provider command-code --model claude-sonnet-4-6
-pi --provider command-code --model deepseek/deepseek-v4-flash
+pi --provider command-code --model claude-sonnet-5-5
+pi --provider command-code --model deepseek/deepseek-v4.1-flash
 ```
 
 Or make it your default in `~/.pi/agent/settings.json`:
@@ -32,7 +32,7 @@ Or make it your default in `~/.pi/agent/settings.json`:
 ```json
 {
   "defaultProvider": "command-code",
-  "defaultModel": "claude-sonnet-4-6"
+  "defaultModel": "claude-sonnet-5-5"
 }
 ```
 
@@ -105,7 +105,7 @@ Those models are then excluded from the catalog and the count is reported at sta
 
 ## Cost tracking
 
-Cost tracking works out of the box for **all 69 models**. Rates are bundled from Command Code's published pricing table, so pi shows real dollar figures on every response.
+Cost tracking works out of the box for **all 94 models**. Rates are bundled from Command Code's published pricing table, so pi shows real dollar figures on every response.
 
 ### Why rates are bundled rather than fetched
 
@@ -139,14 +139,14 @@ The script ships in the tarball, so you can also run it against an installed cop
 node node_modules/pi-command-code/scripts/refresh-rates.mjs
 ```
 
-The script reads Command Code's pricing table, maps display names onto live API model ids, warns about any model with no pricing row, and rewrites `rates.ts` for review. Discounted rows (rendered as `$0.60$0.30`) resolve to the **current** price, not the struck-through one.
+The script reads Command Code's pricing table, maps display names onto live API model ids, warns about any model with no pricing row, and rewrites `rates.ts` for review. Discounted rows (rendered as `$0.60$0.30`) resolve to the **current** price, not the struck-through one. If one id has two pricing rows (a free-tier row and the paid one sharing a display name), the paid row wins — a `$0` entry would silently report a paid model as free.
 
 ### Overriding rates
 
 Enterprise or ZDR rates can differ from list price. Override any model — or set a blanket fallback with `*`:
 
 ```bash
-export COMMANDCODE_RATES="claude-sonnet-4-6=1.5,7.5,0.15,1.875;*=1,2,0.1,1.25"
+export COMMANDCODE_RATES="claude-sonnet-5-5=2,10,0.1,2.5;*=1,2,0.1,1.25"
 ```
 
 Format: entries separated by `;` (or newlines), each `modelId=input,output[,cacheRead[,cacheWrite]]`, in **USD per million tokens**. `;` separates entries because `,` separates the rates within one.
