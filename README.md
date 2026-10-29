@@ -4,19 +4,41 @@
 
 One provider, the whole Command Code catalog — Claude, GPT, Gemini, DeepSeek, Kimi, GLM, Qwen, Grok, MiniMax, Muse Spark and more — fetched live at startup. New models appear automatically, with no package update.
 
+## Features
+
+- **The whole catalog, nothing hardcoded.** 94 models today, discovered from `/provider/v1/models` at startup.
+- **Native pi provider.** `/login command-code` stores the key in pi's credential store; `COMMANDCODE_API_KEY`, `CMD_API_KEY` and `COMMAND_CODE_API_KEY` work as env fallbacks.
+- **The right wire per model.** Catalog-driven routing to Anthropic Messages, OpenAI Responses or Chat Completions, with the per-model `baseUrl` each SDK expects.
+- **Thinking levels everywhere.** Every model registers as a reasoner, and Claude's adaptive-vs-legacy thinking shapes are handled per model.
+- **Cost tracking that works.** Bundled list rates for the whole catalog (94 models today), `COMMANDCODE_RATES` overrides and a `*` fallback.
+- **Zero data retention on request.** Opt-in header, a skip list for models without ZDR coverage, and no stale hardcoded blocklist.
+- **Plain-language errors.** `401`, plan gating and ZDR gaps are named, not passed through as bare status codes; catalog failures surface at session start.
+- **No native dependencies.** Pure ESM and global `fetch`; macOS, Linux and Windows on Node 18+.
+
 ## Install
 
 ```bash
 pi install npm:pi-command-code
 ```
 
-Get an API key from [Command Code Studio](https://commandcode.ai/studio/), then export it:
+Get a key from [Command Code Studio](https://commandcode.ai/studio/), then store it once:
 
-```bash
-export COMMANDCODE_API_KEY=your_key_here
+```text
+pi
+/login command-code      # paste the key; pi keeps it in ~/.pi/agent/auth.json
 ```
 
-Add that to your shell profile to persist it. On Windows, use `setx COMMANDCODE_API_KEY "your_key_here"` (or your shell's equivalent). Pi reads the variable at startup.
+That is the recommended path. pi owns the credential, so it is not tied to any shell's environment, and the Command Code CLI rotating its own stored key no longer breaks this provider — a fresh `/login` is enough.
+
+If you would rather use the environment, export a key before starting pi. Any of these works; the first one set wins:
+
+```bash
+export COMMANDCODE_API_KEY=your_key_here   # this package's name
+export CMD_API_KEY=your_key_here           # the Command Code CLI's name
+export COMMAND_CODE_API_KEY=your_key_here
+```
+
+On Windows, use `setx COMMANDCODE_API_KEY "your_key_here"` (or your shell's equivalent).
 
 > **Plan requirement:** the Provider API needs a plan with API access — the [Provider plan](https://commandcode.ai/provider) ($15/mo pay-as-you-go) or GOAT / Pro / Max / Team. The $1 **Go** plan cannot use the API.
 
@@ -39,38 +61,54 @@ Or make it your default in `~/.pi/agent/settings.json`:
 Browse what's available:
 
 ```bash
-pi --list-models | grep command-code
+pi --list-models command-code     # ids, context window, max out, thinking, images
 ```
+
+## Thinking levels
+
+Every model in the catalog registers as a reasoner, so pi offers thinking levels across the whole catalog, not just Claude:
+
+```bash
+pi --provider command-code --model claude-sonnet-5:high
+pi --provider command-code --model gpt-6-astra:medium
+```
+
+Use pi's levels (`minimal` … `max`); `off` is always available. A catalog that reports `reasoning: false` for a model removes them. Without a `thinkingLevelMap`, pi clamps `xhigh` and `max` to `high` for the OpenAI-shaped families — see [Notes and limitations](#notes-and-limitations) to send the full range.
+
+Claude needs one exception handled in code: Claude 5.x and 4.7+ reject `thinking.type: "enabled"` and require the adaptive shape, while `claude-haiku-4-5-20251001` rejects adaptive and needs the legacy one. This package sets `compat.forceAdaptiveThinking` per model, so both work with no config flag and no family allowlist.
 
 ## Configuration
 
-Every setting is an environment variable, so it works identically on macOS, Linux and Windows.
+Settings are environment variables, or `/login` for the key, so they work identically on macOS, Linux and Windows.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `COMMANDCODE_API_KEY` | — | **Required.** Your Command Code API key. |
+| `COMMANDCODE_API_KEY` | — | API key when you are not using `/login`. `CMD_API_KEY` and `COMMAND_CODE_API_KEY` are accepted too. |
 | `COMMANDCODE_ZDR` | off | Set to `1` to enforce zero data retention on every request. |
 | `COMMANDCODE_ZDR_SKIP` | — | Comma-separated model ids to hide while ZDR is on. |
 | `COMMANDCODE_MAX_TOKENS` | `32768` | Max output tokens per request. Raise it if responses truncate. |
 | `COMMANDCODE_RATES` | — | Override bundled per-model rates (USD per million tokens). See [Cost tracking](#cost-tracking). |
-| `COMMANDCODE_TIMEOUT_MS` | `15000` | Startup catalog/credential timeout. |
+| `COMMANDCODE_TIMEOUT_MS` | `15000` | Catalog fetch timeout at load. |
 | `COMMANDCODE_API_BASE_URL` | `https://api.commandcode.ai` | Point at a gateway, proxy, or self-hosted deployment. |
 
 ## How it routes
 
-Command Code exposes two endpoints, and each takes its own native request shape:
+Command Code exposes three endpoints, and each takes its own native request shape. Every model answers on exactly one of them, and the wrong route is a hard `400`.
 
-| Models | Endpoint | Shape |
+The catalog reports `supported_endpoints` per model, and this package pins each model to the API that serves it:
+
+| Catalog route | pi API | Models |
 | --- | --- | --- |
-| `claude-*` | `/provider/v1/messages` | Anthropic Messages |
-| everything else | `/provider/v1/chat/completions` | OpenAI Chat Completions |
+| `/messages` | `anthropic-messages` | Claude |
+| `/responses` | `openai-responses` | GPT |
+| `/chat/completions` | `openai-completions` | everything else |
 
-Sending a Claude model to `/chat/completions` (or the reverse) is a hard `400 unsupported_model`, so this package picks the API per model by id prefix.
+Routing from the catalog rather than from the model id means a model that moves, or a new family outside the `claude-`/`gpt-` prefixes, keeps working without a release. The id prefix is only the fallback for a catalog that omits the field.
 
-**The subtle part**, and the reason this needed its own package: pi's two SDKs append *different* paths to `baseUrl`.
+**The subtle part**, and the reason this needed its own package: pi's SDKs append *different* paths to `baseUrl`.
 
 ```text
-OpenAI SDK    -> <baseUrl>/chat/completions
+OpenAI SDK    -> <baseUrl>/chat/completions  (and /responses)
 Anthropic SDK -> <baseUrl>/v1/messages
 ```
 
@@ -105,7 +143,7 @@ Those models are then excluded from the catalog and the count is reported at sta
 
 ## Cost tracking
 
-Cost tracking works out of the box for **all 94 models**. Rates are bundled from Command Code's published pricing table, so pi shows real dollar figures on every response.
+Cost tracking works out of the box for **all 94 models**. Rates are bundled from Command Code's published pricing table, so pi shows real dollar figures on every response. Free-tier models record `$0` by design, and startup names any model the table has no row for.
 
 ### Why rates are bundled rather than fetched
 
@@ -161,45 +199,50 @@ Malformed entries are skipped rather than thrown, so a typo can never stop pi fr
 
 One caveat: these are published list rates. A given request can cost slightly less, because Command Code routes open-source models across multiple upstreams and bills the mean per-provider price. Your [Usage](https://commandcode.ai/usage) page remains the source of truth, especially under ZDR where pass-through rates can differ.
 
+DeepSeek models are billed peak/off-peak. The bundled figures are the **off-peak** price the pricing page shows (~17h/day), so a request during 01:00–04:00 or 06:00–10:00 UTC on a weekday costs roughly double what pi reports. Weekends are off-peak all day.
+
 ## Errors you might see
 
 This package turns bare status codes into actionable messages.
 
 | Upstream error | What it means |
 | --- | --- |
-| `401 UNAUTHORIZED` | `COMMANDCODE_API_KEY` is missing or invalid. |
+| `401 UNAUTHORIZED` | The key is missing, rotated or revoked. Run `/login command-code`, or export a current key. |
 | `403 MODEL_NOT_IN_PLAN` | The model isn't in your plan. Upgrade, or use a different model. |
 | `403 upgrade_required` | Your plan has no API access — the Go plan can't use the Provider API. |
 | `422 cmd_zdr_no_providers` | The model has no ZDR upstream; unset `COMMANDCODE_ZDR` or skip the model. |
 | `400 unsupported_model` | Should never occur — this package routes shapes correctly. Please report it. |
 
-Note that `/provider/v1/models` is a **public** endpoint: it returns HTTP 200 even with no key or a bad key. So a successful catalog fetch does not prove your credentials work. This package therefore verifies the key with a real (cheap) request at startup and warns early rather than letting every request fail later.
+**Catalog loads but every request `401`s?** That is a stale key, not a network problem: `/provider/v1/models` is public and returns 200 even with a dead credential, so the model list populates while nothing can run. The usual cause is a key copied into a shell before the Command Code CLI rotated its own. Fix it with `/login command-code`.
+
+This package checks pi's auth status and verifies the key with a real (cheap) request at session start, so a bad key is caught before your first prompt, and a `401` mid-session is rewritten with the fix above.
 
 ## Compatibility
 
+- **pi:** 0.86 or newer. Registration uses the native `Provider` API (`createProvider` from `@earendil-works/pi-ai`), which is what gives `/login` and stored credentials.
 - **OS:** macOS, Linux, Windows. Pure ESM and global `fetch` — no native modules, no shell commands, no filesystem paths, no path separators.
 - **Node:** 18 or newer (pi's own minimum). `engines` is set accordingly.
 - **Models:** the catalog is discovered at runtime, so this package does not need updating when Command Code adds models.
 
 ## Notes and limitations
 
-- **Cost is a published list rate, not a billed amount.** Bundled for all 94 models; override with `COMMANDCODE_RATES`. See [Cost tracking](#cost-tracking).
-- **`maxTokens` is `32768` by default.** The catalog does not report output caps and pi requires a value, so this is a conservative floor. Raise it with `COMMANDCODE_MAX_TOKENS`.
-- **Every model registers as reasoning.** Claude takes extended thinking through `compat.forceAdaptiveThinking`; every other family is OpenAI-compatible and sets `compat.supportsReasoningEffort`, so pi sends `reasoning_effort`. Verified against the live API: all families accept `reasoning_effort: "max"` with HTTP 200 — models that do not think ignore it rather than rejecting it.
+- **Cost is a published list rate, not a billed amount.** Bundled for all 94 models; override with `COMMANDCODE_RATES`. If the API ever returns per-model `pricing`, that value wins over both. See [Cost tracking](#cost-tracking).
+- **`maxTokens` is `32768` by default.** The catalog does not report output caps today, so this is a conservative floor; `max_output_tokens` is honoured as soon as the API sends it. Raise the floor with `COMMANDCODE_MAX_TOKENS`. Context window comes from the catalog's `context_length` (200K fallback).
+- **Every model registers as reasoning**, which is what enables thinking levels; a catalog `reasoning: false` overrides it. Non-Claude families set `compat.supportsReasoningEffort`, so pi actually sends `reasoning_effort` — without it the thinking UI would be a lie. A catalog that omits it keeps the default. See [Thinking levels](#thinking-levels).
 - **Thinking levels above `high` need an override.** No `thinkingLevelMap` is registered, so pi clamps `xhigh` and `max` to `high` for the OpenAI-shaped families. To send the full range, add a `modelOverrides` entry in `~/.pi/agent/models.json` with a `thinkingLevelMap` for that model id.
-- **Claude thinking uses the adaptive shape.** Claude 5.x and 4.7+ reject `thinking.type: "enabled"`, so those models set `compat.forceAdaptiveThinking`. `claude-haiku-4-5-20251001` is the one model that rejects adaptive and keeps the legacy shape. A future model with different requirements would need a code change, not just a catalog refresh.
-- **Text and images only.** Command Code's schema rejects audio, file and document parts. Some catalog models are text-only and will error upstream if sent images.
-- If the catalog fetch fails, the extension logs a warning and registers nothing rather than blocking pi startup. Fix the cause and `/reload`.
+- **Claude thinking uses the adaptive shape.** Claude 5.x and 4.7+ reject `thinking.type: "enabled"`, so every Claude model except `claude-haiku-4-5-20251001` sets `compat.forceAdaptiveThinking`. That rules out a family allowlist: `claude-haiku-5-5` also rejects the legacy shape, while the 4.5 haiku rejects adaptive.
+- **Text and images.** Image input is enabled by default and narrowed by the catalog's `modalities` when it is reported; every family accepted an image when probed.
+- If the catalog fetch fails, the provider registers nothing and says so at session start rather than blocking pi startup. Fix the cause and `/reload`.
 
 ## Development
 
 ```bash
 npm install
-npm test        # 25 tests
+npm test        # 31 tests
 npm run typecheck
 ```
 
-Tests cover the routing rules that make this package work (Claude → Anthropic shape, everything else → OpenAI shape, the two baseUrls staying distinct, the `/v1/v1` regression), the per-family thinking shape, cross-platform config parsing, ZDR opt-in handling, cost-rate parsing and precedence, and plan-error classification.
+Tests cover the routing rules that make this package work (catalog endpoints before id prefix, the three API shapes, the two baseUrls staying distinct, the `/v1/v1` regression), registration with native auth, cross-platform config parsing, ZDR opt-in handling, cost-rate parsing and precedence (including catalog pricing winning), and error classification.
 
 ## License
 

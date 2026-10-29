@@ -1,4 +1,19 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  createProvider,
+  envApiKeyAuth,
+  type Api,
+  type Model,
+} from "@earendil-works/pi-ai";
+// pi resolves bundled pi-ai subpaths by name for installed extensions, and
+// /compat re-exports the same lazy API factories the built-in providers use.
+// The /api/*.lazy subpaths are not in that map, so importing them directly
+// fails from an npm install.
+import {
+  anthropicMessagesApi,
+  openAICompletionsApi,
+  openAIResponsesApi,
+} from "@earendil-works/pi-ai/compat";
 
 import { RATE_CARDS } from "./rates.ts";
 
@@ -32,6 +47,19 @@ import { RATE_CARDS } from "./rates.ts";
  * shell commands, no filesystem paths, no platform-specific separators.
  */
 
+export const PROVIDER_ID = "command-code";
+export const PROVIDER_NAME = "Command Code";
+
+/**
+ * Env vars consulted, in order, when no key is stored by `/login`. Ours first,
+ * then the two names the Command Code CLI and its docs use.
+ */
+export const API_KEY_ENV_VARS = [
+  "COMMANDCODE_API_KEY",
+  "CMD_API_KEY",
+  "COMMAND_CODE_API_KEY",
+] as const;
+
 /** API root, overridable for gateways and on-prem deployments. */
 const API_ROOT = (
   process.env.COMMANDCODE_API_BASE_URL ?? "https://api.commandcode.ai"
@@ -60,34 +88,44 @@ export const needsLegacyThinking = (id: string) =>
   id === "claude-haiku-4-5-20251001";
 
 /**
- * How this endpoint exposes extended thinking.
+ * Which route a model answers on.
  *
- * Claude takes the adaptive shape (except the 4.5 haiku). Everything else is
- * OpenAI-compatible and accepts `reasoning_effort`; without
- * `supportsReasoningEffort`, pi sends no effort at all and the thinking UI
- * would be a lie.
+ * The catalog reports `supported_endpoints` per model, and the wrong route is a
+ * hard 400 (`Model "x" must be called via /provider/v1/messages`). Routing from
+ * that field means a model that moves, or a family outside the claude-/gpt-
+ * prefixes, keeps working without a release. The id prefix is only the fallback
+ * for a catalog that omits the field.
+ *
+ * Verified against the live API: Claude answers on /messages only, GPT on both
+ * /responses and /chat/completions, everything else on /chat/completions.
  */
-function thinkingCompat(id: string): {
-  compat?: {
-    forceAdaptiveThinking?: boolean;
-    supportsReasoningEffort?: boolean;
-    thinkingFormat?: string;
-  };
-} {
-  if (isAnthropicModel(id)) {
-    return needsLegacyThinking(id)
-      ? {}
-      : { compat: { forceAdaptiveThinking: true } };
+export function apiForModel(m: RemoteModel): Api {
+  const endpoints = m.supported_endpoints ?? [];
+  if (endpoints.includes("/messages")) return "anthropic-messages";
+  if (endpoints.includes("/responses") && m.id.startsWith("gpt-")) {
+    return "openai-responses";
   }
-  return {
-    compat: { supportsReasoningEffort: true, thinkingFormat: "openai" },
-  };
+  if (endpoints.includes("/chat/completions")) return "openai-completions";
+  if (endpoints.includes("/responses")) return "openai-responses";
+  return isAnthropicModel(m.id) ? "anthropic-messages" : "openai-completions";
 }
 
 export interface RemoteModel {
   id: string;
   name?: string;
   context_length?: number;
+  /** Routes this model answers on. Present in the live catalog today. */
+  supported_endpoints?: string[];
+  /** Not returned yet; read as soon as the API starts sending them. */
+  pricing?: {
+    input?: number;
+    output?: number;
+    cache_read?: number;
+    cache_write?: number;
+  };
+  max_output_tokens?: number;
+  modalities?: { input?: string[] };
+  reasoning?: boolean;
 }
 
 export interface CostRates {
@@ -237,15 +275,13 @@ export function zdrEnabled(
 }
 
 /**
- * Models known to have no ZDR-capable upstream. When ZDR is on, these are
- * hidden rather than offered, because picking one fails immediately with a 422.
+ * Models to hide while ZDR is on. Picking one would fail immediately with a 422,
+ * because it has no ZDR-capable upstream yet.
  *
- * This list is intentionally EMPTY by default. ZDR coverage changes as Command
- * Code signs new upstream agreements, and a stale hardcoded list would hide
- * models that work. Instead, the package discovers failures at runtime: see
- * `markZdrUnsupported` / the `COMMANDCODE_ZDR_SKIP` env var below. Set
- * COMMANDCODE_ZDR_STRICT_MODELS to a comma-separated list to hide models
- * up front without waiting to hit an error.
+ * Empty by default and never hardcoded: ZDR coverage grows as Command Code signs
+ * upstream agreements, and a stale list would hide models that work. A 422 is
+ * still detected and explained in plain language; this env var only lets you
+ * hide the model up front instead of hitting the error.
  */
 export function zdrSkipList(
   env: Record<string, string | undefined> = process.env,
@@ -260,29 +296,88 @@ export function zdrSkipList(
   );
 }
 
-export function toModelConfig(
+/**
+ * Reads per-model pricing out of the catalog when the API supplies it. Returns
+ * undefined when there is no usable price, so the bundled table still wins.
+ */
+export function costFromPricing(
+  pricing: NonNullable<RemoteModel["pricing"]>,
+): CostRates | undefined {
+  const num = (v: number | undefined): number | undefined =>
+    typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+  const input = num(pricing.input);
+  const output = num(pricing.output);
+  // A price needs at least one usable side; a negative one is not a price.
+  if (input === undefined && output === undefined) return undefined;
+  return {
+    input: input ?? 0,
+    output: output ?? 0,
+    cacheRead: num(pricing.cache_read) ?? 0,
+    cacheWrite: num(pricing.cache_write) ?? 0,
+  };
+}
+
+export function toModel(
   m: RemoteModel,
   maxTokens: number,
   costs: Map<string, CostRates> = new Map(),
-) {
-  const anthropic = isAnthropicModel(m.id);
+  zdr = false,
+): Model<Api> {
+  const api = apiForModel(m);
+  const anthropic = api === "anthropic-messages";
+  // Vision defaults to on: every family in the catalog accepted image input
+  // when probed, and the catalog only narrows it once it reports modalities.
+  const vision = m.modalities?.input
+    ? m.modalities.input.includes("image")
+    : true;
+  const compat = compatFor(m.id, api);
   return {
     id: m.id,
     name: m.name ?? m.id,
-    // Every family here accepts reasoning_effort, and Claude takes extended
-    // thinking through the adaptive shape, so all models can think.
-    reasoning: true,
-    input: ["text", "image"] as ("text" | "image")[],
-    // Bundled Command Code list rates, unless COMMANDCODE_RATES overrides them.
-    cost: resolveCost(m.id, costs),
-    contextWindow: m.context_length ?? DEFAULT_CONTEXT_WINDOW,
-    maxTokens,
-    // Per-model overrides let one provider span both API shapes, including the
-    // differing baseUrl each SDK expects.
-    api: anthropic ? "anthropic-messages" : "openai-completions",
+    api,
+    provider: PROVIDER_ID,
+    // Per-model baseUrl: the two SDKs disagree about who appends /v1.
     baseUrl: anthropic ? anthropicBaseUrl() : openaiBaseUrl(),
-    ...thinkingCompat(m.id),
+    // Every family in the catalog accepts reasoning_effort (verified live), and
+    // pi only offers thinking levels when this is true.
+    reasoning: m.reasoning ?? true,
+    input: vision ? ["text", "image"] : ["text"],
+    // Catalog pricing wins, then COMMANDCODE_RATES, then the bundled table.
+    cost: (m.pricing ? costFromPricing(m.pricing) : undefined) ??
+      resolveCost(m.id, costs),
+    contextWindow: m.context_length ?? DEFAULT_CONTEXT_WINDOW,
+    maxTokens: positiveIntFromEnv(
+      m.max_output_tokens === undefined ? undefined : String(m.max_output_tokens),
+      maxTokens,
+    ),
+    // ZDR rides on the model: that is the field pi merges into each request.
+    headers: zdr ? ZDR_HEADER : undefined,
+    compat,
   };
+}
+
+/**
+ * Per-API compatibility overrides. Verified against the live gateway rather
+ * than assumed from the endpoint advertising compatibility.
+ */
+function compatFor(id: string, api: Api) {
+  if (api !== "anthropic-messages") {
+    return {
+      // pi only sends `reasoning_effort` when this is set, so without it the
+      // thinking UI would be a lie. Every family accepts it; models that do not
+      // think ignore it rather than rejecting it.
+      supportsReasoningEffort: true,
+      thinkingFormat: "openai" as const,
+      // Several upstreams behind this route reject the `developer` role pi sends
+      // to reasoning models, and the max_completion_tokens field it defaults to.
+      // Every upstream accepts `system` and `max_tokens`.
+      supportsDeveloperRole: false,
+      maxTokensField: "max_tokens" as const,
+    };
+  }
+  // Claude 5.x / 4.7+ reject thinking.type=enabled; the 4.5 haiku is the one
+  // model that rejects adaptive instead.
+  return needsLegacyThinking(id) ? undefined : { forceAdaptiveThinking: true };
 }
 
 /**
@@ -293,13 +388,11 @@ export function toModelConfig(
  * nothing about credentials. `verifyApiKey` exists for that reason.
  */
 export async function fetchModels(
-  apiKey: string,
   signal?: AbortSignal,
 ): Promise<RemoteModel[]> {
-  const res = await fetch(`${openaiBaseUrl()}/models`, {
-    headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
-    signal,
-  });
+  // No auth header: the catalog is public, and the key now comes from pi's
+  // credential store rather than this process's environment.
+  const res = await fetch(`${openaiBaseUrl()}/models`, { signal });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const payload = (await res.json()) as { data?: RemoteModel[] };
   return payload.data ?? [];
@@ -327,7 +420,7 @@ export async function verifyApiKey(
       ok: false,
       kind: "missing",
       message:
-        "COMMANDCODE_API_KEY is not set. Create a key at https://commandcode.ai/studio/ then export COMMANDCODE_API_KEY.",
+        "no API key. Run /login command-code, or export COMMANDCODE_API_KEY.",
     };
   }
 
@@ -361,12 +454,13 @@ export async function verifyApiKey(
     const code = body?.error?.code ?? "";
     // 403 is also used for plan gating, which is not a credential problem.
     if (code === "MODEL_NOT_IN_PLAN") return { ok: true };
+    const detail = body?.error?.message;
     return {
       ok: false,
       kind: "rejected",
       message:
-        body?.error?.message ??
-        "Command Code rejected the API key. Check COMMANDCODE_API_KEY.",
+        `the API key was rejected${detail ? ` (${detail})` : ""}. ` +
+        "Run /login command-code to store the current key, or export a fresh COMMANDCODE_API_KEY.",
     };
   }
 
@@ -383,10 +477,21 @@ interface PlanError {
  * Reads a Command Code error payload out of a pi assistant message. pi stores
  * the upstream error text on `errorMessage`; we only need to pattern-match it.
  */
-export function classifyPlanError(
+export function classifyProviderError(
   errorMessage: string | undefined,
 ): PlanError | null {
   if (!errorMessage) return null;
+  // 401 from the gateway: the key is missing, rotated or revoked. This is the
+  // failure mode worth naming, because the raw body says only "invalid token".
+  if (
+    /UNAUTHORIZED|Invalid 'Authorization' header or token/i.test(errorMessage)
+  ) {
+    return {
+      code: "UNAUTHORIZED",
+      message:
+        "Command Code rejected the API key. Run /login command-code to store the current key, or update COMMANDCODE_API_KEY (the Command Code CLI rotates its stored key, so a key copied into your shell can go stale).",
+    };
+  }
   if (/MODEL_NOT_IN_PLAN/i.test(errorMessage)) {
     return {
       code: "MODEL_NOT_IN_PLAN",
@@ -421,19 +526,29 @@ export default async function (pi: ExtensionAPI) {
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   const signal = controller.signal;
 
-  const apiKey = process.env.COMMANDCODE_API_KEY ?? "";
   const zdr = zdrEnabled();
+
+  // A catalog failure must not break pi startup, but it must be visible: the
+  // user gets "no models" otherwise, with no clue why.
+  const reportCatalogFailure = (
+    pi: ExtensionAPI,
+    reason: string,
+  ): void => {
+    console.error(`[command-code] ${reason}`);
+    pi.on("session_start", (_event, ctx) => {
+      ctx.ui.notify(`Command Code: ${reason}`, "warning");
+    });
+  };
 
   let models: RemoteModel[];
   try {
-    models = await fetchModels(apiKey, signal);
+    models = await fetchModels(signal);
   } catch (err) {
-    // Never break pi startup. Register nothing and say why, so the user can
-    // fix it and /reload rather than getting an opaque failure later.
-    console.error(
-      `[command-code] could not load the model catalog: ${
+    reportCatalogFailure(
+      pi,
+      `could not load the model list (${
         err instanceof Error ? err.message : err
-      }. Check your network, or set COMMANDCODE_API_BASE_URL for a proxy.`,
+      }). Check your network, or set COMMANDCODE_API_BASE_URL for a proxy.`,
     );
     return;
   } finally {
@@ -441,17 +556,8 @@ export default async function (pi: ExtensionAPI) {
   }
 
   if (models.length === 0) {
-    console.error("[command-code] model catalog was empty; nothing registered");
+    reportCatalogFailure(pi, "the model catalog was empty; nothing registered.");
     return;
-  }
-
-  // The catalog endpoint does not check auth, so validate credentials now and
-  // warn early instead of letting every request fail with a 401 later.
-  const keyCheck = await verifyApiKey(apiKey, signal);
-  if (!keyCheck.ok) {
-    // Still register the provider: the user may be about to set the key, and
-    // ZDR/plan problems are also worth surfacing through a normal request.
-    console.error(`[command-code] ${keyCheck.message}`);
   }
 
   if (zdr) {
@@ -497,13 +603,60 @@ export default async function (pi: ExtensionAPI) {
     );
   }
 
-  pi.registerProvider("command-code", {
-    name: "Command Code",
-    baseUrl: openaiBaseUrl(),
-    apiKey: "$COMMANDCODE_API_KEY",
-    // Applies to both API shapes, so Claude gets ZDR too.
-    ...(zdr ? { headers: ZDR_HEADER } : {}),
-    models: models.map((m) => toModelConfig(m, maxTokens, costs)),
+  pi.registerProvider(
+    createProvider<Api>({
+      id: PROVIDER_ID,
+      name: PROVIDER_NAME,
+      // Native auth: `pi` then offers `/login command-code`, which stores the
+      // key in pi's credential store instead of relying on this process's
+      // environment. Env vars stay as the fallback, resolved per request, so a
+      // rotated key is picked up without restarting pi.
+      auth: {
+        apiKey: envApiKeyAuth("Command Code API key", [
+          ...API_KEY_ENV_VARS,
+        ]),
+      },
+      models: models.map((m) => toModel(m, maxTokens, costs, zdr)),
+      api: {
+        "anthropic-messages": anthropicMessagesApi(),
+        "openai-completions": openAICompletionsApi(),
+        "openai-responses": openAIResponsesApi(),
+      },
+    }),
+  );
+
+  // The catalog is public, so it proves nothing about credentials. Check once
+  // per process, at session start, instead of failing every request with 401.
+  // Headless runs have no UI, so the warning also goes to stderr there.
+  const warn = (
+    ctx: { hasUI: boolean; ui: { notify: (m: string, t: "warning") => void } },
+    text: string,
+  ): void => {
+    console.error(`[command-code] ${text}`);
+    if (ctx.hasUI) ctx.ui.notify(`Command Code: ${text}`, "warning");
+  };
+
+  let authChecked = false;
+  pi.on("session_start", async (_event, ctx) => {
+    if (authChecked) return;
+    authChecked = true;
+
+    if (!ctx.modelRegistry.getProviderAuthStatus(PROVIDER_ID).configured) {
+      warn(
+        ctx,
+        "no API key. Run /login command-code, or set COMMANDCODE_API_KEY.",
+      );
+      return;
+    }
+
+    const key = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+    if (!key) return;
+    const check = await verifyApiKey(key);
+    // An unreachable network is not a credential problem and not worth a
+    // warning: the request itself reports it.
+    if (!check.ok && check.kind !== "unreachable") {
+      warn(ctx, check.message);
+    }
   });
 
   // Turn opaque upstream errors into actionable ones. Plan gating, missing API
@@ -513,13 +666,13 @@ export default async function (pi: ExtensionAPI) {
     if (message.role !== "assistant") return;
     if (message.stopReason !== "error") return;
     if (
-      message.provider !== "command-code" &&
-      (message as { provider?: string }).provider !== "command-code"
+      message.provider !== PROVIDER_ID &&
+      (message as { provider?: string }).provider !== PROVIDER_ID
     ) {
       return;
     }
 
-    const hint = classifyPlanError(message.errorMessage);
+    const hint = classifyProviderError(message.errorMessage);
     if (!hint) return;
 
     return {

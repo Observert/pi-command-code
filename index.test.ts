@@ -1,19 +1,24 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
+import activate from "./index.ts";
+
 import {
+  API_KEY_ENV_VARS,
   BUNDLED_RATES,
   DEFAULT_MAX_TOKENS,
   NO_COST,
   ZDR_HEADER,
   anthropicBaseUrl,
-  classifyPlanError,
+  classifyProviderError,
   isAnthropicModel,
   openaiBaseUrl,
   parseRateOverrides,
   positiveIntFromEnv,
   resolveCost,
-  toModelConfig,
+  toModel,
+  apiForModel,
+  costFromPricing,
   zdrEnabled,
   zdrSkipList,
 } from "./index.ts";
@@ -23,7 +28,7 @@ import {
 // ---------------------------------------------------------------------------
 
 test("claude models route to the Anthropic messages endpoint", () => {
-  const cfg = toModelConfig(
+  const cfg = toModel(
     { id: "claude-sonnet-4-6", name: "Claude Sonnet 4.6" },
     DEFAULT_MAX_TOKENS,
   );
@@ -37,35 +42,55 @@ test("claude models route to the Anthropic messages endpoint", () => {
 });
 
 test("claude models use adaptive thinking, except the 4.5 haiku", () => {
+  const adaptive = (m: ReturnType<typeof toModel>) =>
+    (m.compat as { forceAdaptiveThinking?: boolean } | undefined)
+      ?.forceAdaptiveThinking;
+
   for (const id of [
     "claude-sonnet-5-5",
     "claude-opus-5",
     "claude-opus-4-7",
     "claude-fable-5",
     "claude-sonnet-4-6",
+    // Verified live: the 5.5 haiku rejects thinking.type=enabled (400) and
+    // accepts adaptive. A family allowlist has to include it.
+    "claude-haiku-5-5",
+    "claude-opus-4-8",
   ]) {
-    const cfg = toModelConfig({ id }, DEFAULT_MAX_TOKENS);
-    assert.equal(
-      cfg.compat?.forceAdaptiveThinking,
-      true,
-      `${id} needs adaptive thinking`,
-    );
+    assert.equal(adaptive(toModel({ id }, DEFAULT_MAX_TOKENS)), true,
+      `${id} needs adaptive thinking`);
   }
 
-  const legacy = toModelConfig(
+  const legacy = toModel(
     { id: "claude-haiku-4-5-20251001" },
     DEFAULT_MAX_TOKENS,
   );
   assert.equal(legacy.compat, undefined, "4.5 haiku rejects adaptive thinking");
 
-  // Non-Claude models get the OpenAI effort knob instead of the adaptive shape.
+  // Non-Claude models get the OpenAI flags instead of the adaptive shape:
+  // effort support so pi actually sends reasoning_effort, plus the conservative
+  // role and max-token fields this gateway accepts.
   assert.deepEqual(
-    toModelConfig({ id: "deepseek/deepseek-v4-pro" }, DEFAULT_MAX_TOKENS).compat,
-    { supportsReasoningEffort: true, thinkingFormat: "openai" },
+    toModel({ id: "deepseek/deepseek-v4-pro" }, DEFAULT_MAX_TOKENS).compat,
+    {
+      supportsReasoningEffort: true,
+      thinkingFormat: "openai",
+      supportsDeveloperRole: false,
+      maxTokensField: "max_tokens",
+    },
   );
 });
 
 test("every family registers as reasoning, with the matching compat", () => {
+  // compat is a per-API union on Model<Api>, so read the two fields we care
+  // about through one narrow view.
+  type Compat = {
+    forceAdaptiveThinking?: boolean;
+    supportsReasoningEffort?: boolean;
+  };
+  const compatOf = (id: string): Compat | undefined =>
+    toModel({ id }, DEFAULT_MAX_TOKENS).compat as Compat | undefined;
+
   for (const id of [
     "claude-sonnet-5-5",
     "claude-haiku-4-5-20251001",
@@ -83,22 +108,23 @@ test("every family registers as reasoning, with the matching compat", () => {
     "stealth/glyph-cluster:free",
     "some/unknown-model",
   ]) {
-    const cfg = toModelConfig({ id }, DEFAULT_MAX_TOKENS);
+    const cfg = toModel({ id }, DEFAULT_MAX_TOKENS);
+    const compat = compatOf(id);
     assert.equal(cfg.reasoning, true, `${id} should register as reasoning`);
     if (isAnthropicModel(id)) {
       assert.equal(
-        cfg.compat?.supportsReasoningEffort,
+        compat?.supportsReasoningEffort,
         undefined,
         `${id} must not send OpenAI reasoning_effort`,
       );
     } else {
       assert.equal(
-        cfg.compat?.supportsReasoningEffort,
+        compat?.supportsReasoningEffort,
         true,
         `${id} needs supportsReasoningEffort or pi sends no effort`,
       );
       assert.equal(
-        cfg.compat?.forceAdaptiveThinking,
+        compat?.forceAdaptiveThinking,
         undefined,
         `${id} is not an Anthropic model`,
       );
@@ -115,7 +141,7 @@ test("non-claude models route to the OpenAI chat completions endpoint", () => {
     "xai/grok-4.6",
     "meta/muse-spark-1.3",
   ]) {
-    const cfg = toModelConfig({ id }, DEFAULT_MAX_TOKENS);
+    const cfg = toModel({ id }, DEFAULT_MAX_TOKENS);
     assert.equal(
       cfg.api,
       "openai-completions",
@@ -159,8 +185,188 @@ test("only the claude- prefix is treated as Anthropic", () => {
   assert.equal(isAnthropicModel("deepseek/deepseek-v4-flash"), false);
 });
 
+test("routing follows the catalog before the id prefix", () => {
+  // Claude answers on /messages only.
+  assert.equal(
+    apiForModel({ id: "claude-sonnet-5", supported_endpoints: ["/messages"] }),
+    "anthropic-messages",
+  );
+  // GPT answers on both; /responses is the richer one, so it wins.
+  assert.equal(
+    apiForModel({
+      id: "gpt-6-astra",
+      supported_endpoints: ["/chat/completions", "/responses"],
+    }),
+    "openai-responses",
+  );
+  // A non-gpt model that only speaks /responses still reaches that route.
+  assert.equal(
+    apiForModel({ id: "brand/new", supported_endpoints: ["/responses"] }),
+    "openai-responses",
+  );
+  assert.equal(
+    apiForModel({
+      id: "moonshotai/Kimi-K3",
+      supported_endpoints: ["/chat/completions"],
+    }),
+    "openai-completions",
+  );
+
+  // No catalog metadata: the id prefix is the fallback, so a brand-new family
+  // still lands somewhere sensible.
+  assert.equal(apiForModel({ id: "claude-sonnet-6" }), "anthropic-messages");
+  assert.equal(apiForModel({ id: "brand/new" }), "openai-completions");
+  assert.equal(
+    apiForModel({ id: "claude-x", supported_endpoints: [] }),
+    "anthropic-messages",
+  );
+
+  // The route decides the baseUrl, and the baseUrls differ on purpose.
+  const responses = toModel(
+    { id: "gpt-6-astra", supported_endpoints: ["/responses"] },
+    DEFAULT_MAX_TOKENS,
+  );
+  assert.equal(responses.api, "openai-responses");
+  assert.equal(responses.baseUrl, openaiBaseUrl());
+});
+
+test("catalog pricing and caps win when the API reports them", () => {
+  const priced = toModel(
+    {
+      id: "claude-sonnet-4-6",
+      pricing: { input: 1, output: 2, cache_read: 0.1, cache_write: 0.2 },
+      max_output_tokens: 128000,
+      modalities: { input: ["text"] },
+      reasoning: false,
+    },
+    DEFAULT_MAX_TOKENS,
+  );
+  // Catalog price beats the bundled table for the same model.
+  assert.deepEqual(priced.cost, {
+    input: 1,
+    output: 2,
+    cacheRead: 0.1,
+    cacheWrite: 0.2,
+  });
+  assert.equal(priced.maxTokens, 128000);
+  assert.deepEqual(priced.input, ["text"]);
+  // An explicit reasoning:false from the catalog is respected.
+  assert.equal(priced.reasoning, false);
+
+  // Partial or empty pricing must not fabricate a cost.
+  assert.deepEqual(costFromPricing({ input: 1, output: 2 }), {
+    input: 1,
+    output: 2,
+    cacheRead: 0,
+    cacheWrite: 0,
+  });
+  assert.equal(costFromPricing({}), undefined);
+  assert.equal(costFromPricing({ input: -5 }), undefined);
+  assert.deepEqual(costFromPricing({ input: -5, output: 1 }), {
+    input: 0,
+    output: 1,
+    cacheRead: 0,
+    cacheWrite: 0,
+  });
+
+  // Without catalog metadata the caller's maxTokens still applies.
+  assert.equal(
+    toModel({ id: "brand/new" }, 8192).maxTokens,
+    8192,
+  );
+});
+
+test("zdr rides on each model, not the provider", () => {
+  assert.deepEqual(
+    toModel({ id: "claude-sonnet-5" }, DEFAULT_MAX_TOKENS, new Map(), true)
+      .headers,
+    ZDR_HEADER,
+  );
+  assert.equal(
+    toModel({ id: "claude-sonnet-5" }, DEFAULT_MAX_TOKENS).headers,
+    undefined,
+  );
+});
+
+test("the extension registers native auth and every API shape", async () => {
+  type RegisteredProvider = {
+    id: string;
+    auth: { apiKey?: { login?: unknown; resolve?: unknown } };
+    streamSimple?: unknown;
+    getModels(): readonly { id: string; api: string; baseUrl: string }[];
+  };
+  type Pi = Parameters<typeof activate>[0];
+
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(
+      JSON.stringify({
+        data: [
+          { id: "claude-sonnet-5", supported_endpoints: ["/messages"] },
+          {
+            id: "gpt-6-astra",
+            supported_endpoints: ["/chat/completions", "/responses"],
+          },
+          {
+            id: "deepseek/deepseek-v4-flash",
+            supported_endpoints: ["/chat/completions"],
+          },
+        ],
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    )) as typeof fetch;
+
+  try {
+    let provider: RegisteredProvider | null = null;
+    const handlers = new Map<string, unknown>();
+    const pi = {
+      registerProvider: (p: RegisteredProvider) => {
+        provider = p;
+      },
+      on: (name: string, handler: unknown) => {
+        handlers.set(name, handler);
+        return () => {};
+      },
+    } as unknown as Pi;
+
+    await activate(pi);
+
+    const registered = provider as RegisteredProvider | null;
+    assert.ok(registered, "provider was registered");
+    assert.equal(registered.id, "command-code");
+    // Login is what makes /login command-code (stored credentials) possible.
+    assert.equal(typeof registered.auth.apiKey?.login, "function");
+    assert.equal(typeof registered.auth.apiKey?.resolve, "function");
+    assert.equal(typeof registered.streamSimple, "function");
+
+    // One provider spanning three wire shapes: each model picked its route
+    // from the catalog, and the baseUrl follows the route.
+    const models = registered.getModels();
+    assert.deepEqual(
+      models.map((m) => `${m.id} -> ${m.api} @ ${m.baseUrl}`).sort(),
+      [
+        `claude-sonnet-5 -> anthropic-messages @ ${anthropicBaseUrl()}`,
+        `deepseek/deepseek-v4-flash -> openai-completions @ ${openaiBaseUrl()}`,
+        `gpt-6-astra -> openai-responses @ ${openaiBaseUrl()}`,
+      ].sort(),
+    );
+    assert.ok(handlers.has("session_start"));
+    assert.ok(handlers.has("message_end"));
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("the key is read from our env var and both CLI spellings", () => {
+  assert.deepEqual([...API_KEY_ENV_VARS], [
+    "COMMANDCODE_API_KEY",
+    "CMD_API_KEY",
+    "COMMAND_CODE_API_KEY",
+  ]);
+});
+
 test("catalog metadata maps through with sane fallbacks", () => {
-  const withLen = toModelConfig(
+  const withLen = toModel(
     { id: "claude-sonnet-5", name: "Claude Sonnet 5", context_length: 1000000 },
     DEFAULT_MAX_TOKENS,
   );
@@ -168,15 +374,17 @@ test("catalog metadata maps through with sane fallbacks", () => {
   assert.equal(withLen.name, "Claude Sonnet 5");
   assert.equal(withLen.reasoning, true);
 
-  const bare = toModelConfig({ id: "some/model" }, DEFAULT_MAX_TOKENS);
+  const bare = toModel({ id: "some/model" }, DEFAULT_MAX_TOKENS);
   assert.equal(bare.name, "some/model"); // name falls back to id
   assert.ok(bare.contextWindow > 0);
   assert.equal(bare.maxTokens, DEFAULT_MAX_TOKENS);
+  // Reasoners by default: pi only offers thinking levels when this is true,
+  // and every family in the catalog accepts reasoning_effort.
   assert.equal(bare.reasoning, true);
 });
 
 test("maxTokens is injectable so users can raise it", () => {
-  const cfg = toModelConfig({ id: "some/model" }, 12345);
+  const cfg = toModel({ id: "some/model" }, 12345);
   assert.equal(cfg.maxTokens, 12345);
 });
 
@@ -257,17 +465,16 @@ test("bundled list rates ship for the whole catalog", () => {
     cacheRead: 0.3,
     cacheWrite: 3.75,
   });
-  // Free-tier models are legitimately $0, not missing.
-  assert.deepEqual(BUNDLED_RATES.get("stealth/glyph-cluster:free"), {
-    input: 0,
-    output: 0,
-    cacheRead: 0,
-    cacheWrite: 0,
-  });
+  // Free-tier models are legitimately $0, not missing. Checked as a category
+  // rather than by id: free promos come and go with the catalog.
+  const freeRows = [...BUNDLED_RATES.values()].filter(
+    (r) => r.input === 0 && r.output === 0,
+  );
+  assert.ok(freeRows.length > 0, "expected a free tier to record $0, not vanish");
 });
 
 test("unknown models still cost zero rather than a guess", () => {
-  const cfg = toModelConfig(
+  const cfg = toModel(
     { id: "definitely/not-a-real-model" },
     DEFAULT_MAX_TOKENS,
   );
@@ -358,7 +565,7 @@ test("resolveCost precedence: override > bundled > zero", () => {
 
 test("COMMANDCODE_RATES overrides the bundled table", () => {
   const costs = parseRateOverrides("claude-sonnet-4-6=1.5,7.5,0.15,1.875");
-  const cfg = toModelConfig(
+  const cfg = toModel(
     { id: "claude-sonnet-4-6" },
     DEFAULT_MAX_TOKENS,
     costs,
@@ -371,7 +578,7 @@ test("COMMANDCODE_RATES overrides the bundled table", () => {
   });
 
   // A model with a bundled rate but no override keeps the bundled rate.
-  const other = toModelConfig({ id: "gpt-5.6-sol" }, DEFAULT_MAX_TOKENS, costs);
+  const other = toModel({ id: "gpt-5.6-sol" }, DEFAULT_MAX_TOKENS, costs);
   assert.ok(other.cost.input > 0, "bundled rate should still apply");
 });
 
@@ -380,26 +587,37 @@ test("COMMANDCODE_RATES overrides the bundled table", () => {
 // ---------------------------------------------------------------------------
 
 test("plan errors are classified into actionable messages", () => {
-  const notInPlan = classifyPlanError(
+  const notInPlan = classifyProviderError(
     "MODEL_NOT_IN_PLAN: Claude Opus 5 available in Provider and above plans",
   );
   assert.equal(notInPlan?.code, "MODEL_NOT_IN_PLAN");
   assert.match(notInPlan!.message, /plan/i);
 
-  const noApi = classifyPlanError("upgrade_required");
+  const noApi = classifyProviderError("upgrade_required");
   assert.equal(noApi?.code, "upgrade_required");
   // The Go plan has no API access; the hint should say so.
   assert.match(noApi!.message, /Go plan/);
 
-  const zdrGap = classifyPlanError("cmd_zdr_no_providers");
+  const zdrGap = classifyProviderError("cmd_zdr_no_providers");
   assert.equal(zdrGap?.code, "cmd_zdr_no_providers");
   assert.match(zdrGap!.message, /ZDR/);
 });
 
+test("a rejected key is named, not passed through raw", () => {
+  // The gateway body is just "Invalid 'Authorization' header or token."
+  const auth = classifyProviderError(
+    `401 {"type":"error","error":{"type":"authentication_error","message":"Invalid 'Authorization' header or token."}}`,
+  );
+  assert.equal(auth?.code, "UNAUTHORIZED");
+  assert.match(auth!.message, /\/login command-code/);
+  // Points at the real cause: a key copied into a shell goes stale.
+  assert.match(auth!.message, /stale/);
+});
+
 test("unrelated errors are left untouched", () => {
-  assert.equal(classifyPlanError(undefined), null);
-  assert.equal(classifyPlanError(""), null);
-  assert.equal(classifyPlanError("rate limit exceeded"), null);
-  assert.equal(classifyPlanError("context_length_exceeded"), null);
-  assert.equal(classifyPlanError("Connection reset by peer"), null);
+  assert.equal(classifyProviderError(undefined), null);
+  assert.equal(classifyProviderError(""), null);
+  assert.equal(classifyProviderError("rate limit exceeded"), null);
+  assert.equal(classifyProviderError("context_length_exceeded"), null);
+  assert.equal(classifyProviderError("Connection reset by peer"), null);
 });

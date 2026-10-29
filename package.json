@@ -1,6 +1,6 @@
 {
   "name": "pi-command-code",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Command Code Provider API for Pi — every top model (Claude, GPT, Gemini, DeepSeek, Kimi, GLM, Qwen, Grok & more) behind one OpenAI- or Anthropic-compatible endpoint, with the live model catalog discovered automatically at startup.",
   "type": "module",
   "keywords": [
@@ -48,9 +48,12 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-ai": ">=0.86.0",
+    "@earendil-works/pi-coding-agent": ">=0.86.0"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^1.4.0",
+    "@earendil-works/pi-coding-agent": "^1.4.0",
     "@types/node": "^24.0.0",
     "typescript": "^7.0.0"
   },
