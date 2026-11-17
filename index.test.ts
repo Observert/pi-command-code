@@ -8,6 +8,7 @@ import {
   BUNDLED_RATES,
   DEFAULT_MAX_TOKENS,
   NO_COST,
+  PACKAGE_VERSION,
   ZDR_HEADER,
   anthropicBaseUrl,
   classifyProviderError,
@@ -22,6 +23,28 @@ import {
   zdrEnabled,
   zdrSkipList,
 } from "./index.ts";
+import { cachePath, readCache, writeCache } from "./catalog.ts";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+/**
+ * Points the catalog cache and the routing file at a scratch directory. Both
+ * are read at activate() time, so this must run before the extension loads.
+ */
+function isolateAgentDir(): { dir: string; cleanup: () => void } {
+  const dir = mkdtempSync(join(tmpdir(), "cc-provider-test-"));
+  process.env.COMMANDCODE_MODELS_CACHE = join(dir, "catalog.json");
+  process.env.COMMANDCODE_ROUTING_FILE = join(dir, "routing.json");
+  return {
+    dir,
+    cleanup: () => {
+      delete process.env.COMMANDCODE_MODELS_CACHE;
+      delete process.env.COMMANDCODE_ROUTING_FILE;
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Routing: the reason this package exists.
@@ -297,6 +320,7 @@ test("the extension registers native auth and every API shape", async () => {
   };
   type Pi = Parameters<typeof activate>[0];
 
+  const sandbox = isolateAgentDir();
   const realFetch = globalThis.fetch;
   globalThis.fetch = (async () =>
     new Response(
@@ -354,6 +378,7 @@ test("the extension registers native auth and every API shape", async () => {
     assert.ok(handlers.has("message_end"));
   } finally {
     globalThis.fetch = realFetch;
+    sandbox.cleanup();
   }
 });
 
@@ -620,4 +645,143 @@ test("unrelated errors are left untouched", () => {
   assert.equal(classifyProviderError("rate limit exceeded"), null);
   assert.equal(classifyProviderError("context_length_exceeded"), null);
   assert.equal(classifyProviderError("Connection reset by peer"), null);
+});
+
+// ---------------------------------------------------------------------------
+// The wiring: client-view capabilities must survive into the registered model.
+// ---------------------------------------------------------------------------
+
+test("client-view capabilities reach the registered models", async () => {
+  type RegisteredProvider = {
+    getModels(): readonly {
+      id: string;
+      api: string;
+      input: readonly string[];
+      maxTokens: number;
+      thinkingLevelMap?: Record<string, string | null>;
+      cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
+    }[];
+  };
+  type Pi = Parameters<typeof activate>[0];
+
+  const sandbox = isolateAgentDir();
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async (url: string | URL) => {
+    const body = String(url).includes("view=client")
+      ? {
+          catalogVersion: "abc123",
+          refreshAfterSeconds: 900,
+          data: [
+            {
+              id: "zai-org/GLM-5.3",
+              inputModalities: ["text"],
+              reasoningEfforts: ["low", "high", "max"],
+              maxOutputTokens: 131072,
+              pricing: { inputCost: 1.4, outputCost: 4.4, cacheReadCost: 0.26 },
+              minimumPlan: "individual-go",
+            },
+          ],
+        }
+      : { data: [{ id: "zai-org/GLM-5.3", supported_endpoints: ["/chat/completions"], context_length: 1_000_000 }] };
+    return new Response(JSON.stringify(body), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  }) as unknown as typeof fetch;
+
+  try {
+    let provider: RegisteredProvider | null = null;
+    const commands: string[] = [];
+    const pi = {
+      registerProvider: (p: RegisteredProvider) => {
+        provider = p;
+      },
+      registerCommand: (name: string) => {
+        commands.push(name);
+      },
+      on: () => () => {},
+    } as unknown as Pi;
+
+    await activate(pi);
+
+    const model = (provider as unknown as RegisteredProvider).getModels()[0];
+    assert.ok(model);
+    // Rejects `medium`: it must not be offered, or pi sends it and 400s.
+    assert.equal(model.thinkingLevelMap?.medium, null);
+    assert.equal(model.thinkingLevelMap?.max, "max");
+    // Text-only in the catalog, so no image blocks go upstream.
+    assert.deepEqual(model.input, ["text"]);
+    // The published cap, not the 32k floor the catalog never filled in before.
+    assert.equal(model.maxTokens, 131072);
+    assert.deepEqual(model.cost, { input: 1.4, output: 4.4, cacheRead: 0.26, cacheWrite: 0 });
+
+    assert.deepEqual(commands.sort(), [
+      "commandcode-diagnostics",
+      "commandcode-endpoint",
+      "commandcode-quota",
+      "commandcode-refresh",
+      "commandcode-status",
+    ]);
+
+    // The fetch wrote a cache we can restore from.
+    assert.ok(readCache(cachePath())?.models.length === 1);
+  } finally {
+    globalThis.fetch = realFetch;
+    sandbox.cleanup();
+  }
+});
+
+test("an offline start registers the cached catalog instead of nothing", async () => {
+  type RegisteredProvider = { getModels(): readonly { id: string }[] };
+  type Pi = Parameters<typeof activate>[0];
+
+  const sandbox = isolateAgentDir();
+  const realFetch = globalThis.fetch;
+  writeCache(cachePath(), {
+    catalogVersion: "cached",
+    fetchedAt: Date.now(),
+    models: [
+      { id: "deepseek/deepseek-v4-flash", supported_endpoints: ["/chat/completions"] },
+      { id: "claude-sonnet-5-5", supported_endpoints: ["/messages"] },
+    ],
+  });
+  globalThis.fetch = (async () => {
+    throw new Error("offline");
+  }) as unknown as typeof fetch;
+
+  try {
+    let provider: RegisteredProvider | null = null;
+    const pi = {
+      registerProvider: (p: RegisteredProvider) => {
+        provider = p;
+      },
+      registerCommand: () => {},
+      on: () => () => {},
+    } as unknown as Pi;
+
+    await activate(pi);
+
+    assert.deepEqual(
+      (provider as unknown as RegisteredProvider).getModels().map((m) => m.id).sort(),
+      ["claude-sonnet-5-5", "deepseek/deepseek-v4-flash"],
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+    sandbox.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Release hygiene: the version shown by /commandcode-status is the published one.
+// ---------------------------------------------------------------------------
+
+test("the reported package version matches package.json", () => {
+  const pkg = JSON.parse(
+    readFileSync(join(import.meta.dirname, "package.json"), "utf8"),
+  ) as { version: string };
+  assert.equal(
+    PACKAGE_VERSION,
+    pkg.version,
+    "bump PACKAGE_VERSION in index.ts together with package.json",
+  );
 });
