@@ -1,9 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
   createProvider,
-  envApiKeyAuth,
   type Api,
   type Model,
+  type ModelCost,
 } from "@earendil-works/pi-ai";
 // pi resolves bundled pi-ai subpaths by name for installed extensions, and
 // /compat re-exports the same lazy API factories the built-in providers use.
@@ -16,19 +16,55 @@ import {
 } from "@earendil-works/pi-ai/compat";
 
 import { RATE_CARDS } from "./rates.ts";
+import {
+  cacheIsStale,
+  cachePath,
+  fetchCatalog,
+  readCache,
+  writeCache,
+  type Catalog,
+  type RemoteModel,
+} from "./catalog.ts";
+import {
+  costFromCatalog,
+  maxTokensFor,
+  planRequirement,
+  supportsImages,
+  thinkingLevelMap,
+  wireLabel,
+} from "./capabilities.ts";
+import { commandCodeAuth } from "./auth.ts";
+import {
+  applyRouting,
+  readRouting,
+  routingPath,
+  writeRouting,
+  type Routing,
+  type Wire,
+} from "./routing.ts";
+import { fetchQuota, formatQuota } from "./quota.ts";
+import {
+  formatDiagnostics,
+  formatStatus,
+  parseEndpointArgs,
+  type CatalogState,
+  type LastRequest,
+} from "./commands.ts";
+import { withPeakPricing } from "./peak.ts";
 
 /**
  * Command Code Provider API for pi.
  *
- * Command Code exposes two endpoints, each taking its own native request shape:
- *   - /provider/v1/chat/completions  (OpenAI shape)    -> non-Claude models
+ * Command Code exposes three endpoints, each taking its own request shape:
+ *   - /provider/v1/chat/completions  (OpenAI shape)    -> most models
+ *   - /provider/v1/responses         (OpenAI Responses) -> models that ask for it
  *   - /provider/v1/messages          (Anthropic shape) -> Claude models
  *
- * Sending a Claude model to /chat/completions (or a non-Claude model to
- * /messages) is a hard 400 with code `unsupported_model`, so the API type is
- * chosen per model by id prefix.
+ * Sending a model to the wrong wire is a hard 400, so the API type is chosen
+ * per model from the catalog's `supported_endpoints`, with the id prefix only
+ * as the fallback for a catalog that omits the field.
  *
- * Why baseUrl is set per model rather than once on the provider: both pi SDKs
+ * Why baseUrl is set per model rather than once on the provider: the two SDKs
  * append their own path to baseUrl, and they disagree.
  *
  *   OpenAI SDK    -> <baseUrl>/chat/completions
@@ -41,24 +77,14 @@ import { RATE_CARDS } from "./rates.ts";
  *   Anthropic: https://api.commandcode.ai/provider     -> .../provider/v1/messages
  *
  * Using the OpenAI baseUrl for both yields .../provider/v1/v1/messages -> 404.
- *
- * Everything here is plain ESM + global fetch, so it runs unchanged on macOS,
- * Linux and Windows under any Node >= 18 (pi's minimum). No native modules, no
- * shell commands, no filesystem paths, no platform-specific separators.
  */
 
 export const PROVIDER_ID = "command-code";
 export const PROVIDER_NAME = "Command Code";
+export const PACKAGE_VERSION = "1.3.0";
 
-/**
- * Env vars consulted, in order, when no key is stored by `/login`. Ours first,
- * then the two names the Command Code CLI and its docs use.
- */
-export const API_KEY_ENV_VARS = [
-  "COMMANDCODE_API_KEY",
-  "CMD_API_KEY",
-  "COMMAND_CODE_API_KEY",
-] as const;
+export { API_KEY_ENV_VARS } from "./auth.ts";
+export type { RemoteModel } from "./catalog.ts";
 
 /** API root, overridable for gateways and on-prem deployments. */
 const API_ROOT = (
@@ -69,13 +95,12 @@ const API_ROOT = (
 
 export const openaiBaseUrl = () => `${API_ROOT}/provider/v1`;
 export const anthropicBaseUrl = () => `${API_ROOT}/provider`;
-
 export const MODELS_URL = `${openaiBaseUrl()}/models`;
 
 /**
  * Claude is served through the Anthropic Messages endpoint; every other model
  * family in the catalog (OpenAI, Google, DeepSeek, Moonshot, Z.ai, MiniMax,
- * Qwen, xAI, Meta, ...) goes through OpenAI Chat Completions.
+ * Qwen, xAI, Meta, ...) goes through an OpenAI-shaped endpoint.
  */
 export const isAnthropicModel = (id: string) => id.startsWith("claude-");
 
@@ -86,6 +111,20 @@ export const isAnthropicModel = (id: string) => id.startsWith("claude-");
  */
 export const needsLegacyThinking = (id: string) =>
   id === "claude-haiku-4-5-20251001";
+
+/** Maps a routing override onto the API type that serves it. */
+function apiForWire(wire: Wire): Api | undefined {
+  switch (wire) {
+    case "messages":
+      return "anthropic-messages";
+    case "responses":
+      return "openai-responses";
+    case "chat-completions":
+      return "openai-completions";
+    default:
+      return undefined;
+  }
+}
 
 /**
  * Which route a model answers on.
@@ -98,8 +137,13 @@ export const needsLegacyThinking = (id: string) =>
  *
  * Verified against the live API: Claude answers on /messages only, GPT on both
  * /responses and /chat/completions, everything else on /chat/completions.
+ *
+ * An explicit override from /commandcode-endpoint wins over both.
  */
-export function apiForModel(m: RemoteModel): Api {
+export function apiForModel(m: RemoteModel, override?: Wire): Api {
+  const forced = override && override !== "auto" ? apiForWire(override) : undefined;
+  if (forced) return forced;
+
   const endpoints = m.supported_endpoints ?? [];
   if (endpoints.includes("/messages")) return "anthropic-messages";
   if (endpoints.includes("/responses") && m.id.startsWith("gpt-")) {
@@ -108,24 +152,6 @@ export function apiForModel(m: RemoteModel): Api {
   if (endpoints.includes("/chat/completions")) return "openai-completions";
   if (endpoints.includes("/responses")) return "openai-responses";
   return isAnthropicModel(m.id) ? "anthropic-messages" : "openai-completions";
-}
-
-export interface RemoteModel {
-  id: string;
-  name?: string;
-  context_length?: number;
-  /** Routes this model answers on. Present in the live catalog today. */
-  supported_endpoints?: string[];
-  /** Not returned yet; read as soon as the API starts sending them. */
-  pricing?: {
-    input?: number;
-    output?: number;
-    cache_read?: number;
-    cache_write?: number;
-  };
-  max_output_tokens?: number;
-  modalities?: { input?: string[] };
-  reasoning?: boolean;
 }
 
 export interface CostRates {
@@ -138,22 +164,17 @@ export interface CostRates {
 /**
  * Cost reporting.
  *
- * Command Code does NOT return cost anywhere in the API. Verified against the
- * live API: `/provider/v1/models` exposes only id/object/created/owned_by/
- * name/context_length, response headers carry no billing fields, and both the
- * OpenAI- and Anthropic-shaped bodies (including the final streaming chunk)
- * report token counts only. There is no pricing endpoint.
- *
- * pi does not read cost from providers either: it computes it locally as
+ * pi does not read cost from providers: it computes it locally as
  * `rate_per_million * tokens / 1_000_000` from the `cost` block registered per
- * model, against the real token counts the API does return. So accurate cost
- * tracking needs rates, and Command Code publishes them in its docs rather than
- * over the API — see rates.ts, generated by scripts/refresh-rates.mjs.
+ * model, against the real token counts the API does return.
  *
- * Precedence, highest first:
- *   1. COMMANDCODE_RATES   (your overrides, e.g. enterprise/ZDR rates)
- *   2. the bundled table   (Command Code's published list rates)
- *   3. zero                (unknown model: never invent a number)
+ * Sources, highest first:
+ *   1. the live catalog's `pricing` (per model, including context tiers)
+ *   2. COMMANDCODE_RATES   (your overrides, e.g. enterprise/ZDR rates)
+ *   3. the bundled table   (Command Code's published list rates)
+ *   4. zero                (unknown model: never invent a number)
+ *
+ * DeepSeek peak hours are applied per request by peak.ts, not here.
  */
 export const NO_COST: CostRates = {
   input: 0,
@@ -237,9 +258,9 @@ export function resolveCost(
 }
 
 /**
- * pi requires a maxTokens value and the catalog does not report output caps.
- * 32k is the conservative floor everything in the catalogue accepts. Override
- * per-install with COMMANDCODE_MAX_TOKENS if you hit truncation.
+ * pi requires a maxTokens value. The catalog publishes one for the models that
+ * cap output below their context window; the rest get this floor, which every
+ * model in the catalog accepts.
  */
 export const DEFAULT_MAX_TOKENS = 32768;
 
@@ -275,13 +296,13 @@ export function zdrEnabled(
 }
 
 /**
- * Models to hide while ZDR is on. Picking one would fail immediately with a 422,
- * because it has no ZDR-capable upstream yet.
+ * Extra models to hide while ZDR is on, beyond the ones the catalog itself
+ * marks as having no ZDR path.
  *
- * Empty by default and never hardcoded: ZDR coverage grows as Command Code signs
- * upstream agreements, and a stale list would hide models that work. A 422 is
- * still detected and explained in plain language; this env var only lets you
- * hide the model up front instead of hitting the error.
+ * Empty by default and never hardcoded: ZDR coverage grows as Command Code
+ * signs upstream agreements, and a stale list would hide models that work. A
+ * 422 is still detected and explained in plain language; this env var only
+ * lets you hide a model up front instead of hitting the error.
  */
 export function zdrSkipList(
   env: Record<string, string | undefined> = process.env,
@@ -297,24 +318,18 @@ export function zdrSkipList(
 }
 
 /**
- * Reads per-model pricing out of the catalog when the API supplies it. Returns
- * undefined when there is no usable price, so the bundled table still wins.
+ * Reads per-model pricing out of the catalog. Returns undefined when there is
+ * no usable price, so the override/bundled table still wins.
  */
 export function costFromPricing(
   pricing: NonNullable<RemoteModel["pricing"]>,
-): CostRates | undefined {
-  const num = (v: number | undefined): number | undefined =>
-    typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
-  const input = num(pricing.input);
-  const output = num(pricing.output);
-  // A price needs at least one usable side; a negative one is not a price.
-  if (input === undefined && output === undefined) return undefined;
-  return {
-    input: input ?? 0,
-    output: output ?? 0,
-    cacheRead: num(pricing.cache_read) ?? 0,
-    cacheWrite: num(pricing.cache_write) ?? 0,
-  };
+): ModelCost | undefined {
+  return costFromCatalog(pricing);
+}
+
+export interface ModelOptions {
+  /** Wire chosen by /commandcode-endpoint, when one is set for this model. */
+  wire?: Wire;
 }
 
 export function toModel(
@@ -322,15 +337,12 @@ export function toModel(
   maxTokens: number,
   costs: Map<string, CostRates> = new Map(),
   zdr = false,
+  options: ModelOptions = {},
 ): Model<Api> {
-  const api = apiForModel(m);
+  const api = apiForModel(m, options.wire);
   const anthropic = api === "anthropic-messages";
-  // Vision defaults to on: every family in the catalog accepted image input
-  // when probed, and the catalog only narrows it once it reports modalities.
-  const vision = m.modalities?.input
-    ? m.modalities.input.includes("image")
-    : true;
   const compat = compatFor(m.id, api);
+  const thinking = thinkingLevelMap(m.reasoningEfforts);
   return {
     id: m.id,
     name: m.name ?? m.id,
@@ -338,18 +350,17 @@ export function toModel(
     provider: PROVIDER_ID,
     // Per-model baseUrl: the two SDKs disagree about who appends /v1.
     baseUrl: anthropic ? anthropicBaseUrl() : openaiBaseUrl(),
-    // Every family in the catalog accepts reasoning_effort (verified live), and
-    // pi only offers thinking levels when this is true.
+    // pi only offers thinking levels when this is true. Models the catalog
+    // reports no selectable effort for are still reasoners — they just map
+    // every level to null below, which leaves `off` alone in the picker.
     reasoning: m.reasoning ?? true,
-    input: vision ? ["text", "image"] : ["text"],
+    ...(thinking ? { thinkingLevelMap: thinking } : {}),
+    input: supportsImages(m) ? ["text", "image"] : ["text"],
     // Catalog pricing wins, then COMMANDCODE_RATES, then the bundled table.
-    cost: (m.pricing ? costFromPricing(m.pricing) : undefined) ??
+    cost: (m.pricing ? costFromCatalog(m.pricing) : undefined) ??
       resolveCost(m.id, costs),
     contextWindow: m.context_length ?? DEFAULT_CONTEXT_WINDOW,
-    maxTokens: positiveIntFromEnv(
-      m.max_output_tokens === undefined ? undefined : String(m.max_output_tokens),
-      maxTokens,
-    ),
+    maxTokens: maxTokensFor(m, maxTokens),
     // ZDR rides on the model: that is the field pi merges into each request.
     headers: zdr ? ZDR_HEADER : undefined,
     compat,
@@ -364,8 +375,8 @@ function compatFor(id: string, api: Api) {
   if (api !== "anthropic-messages") {
     return {
       // pi only sends `reasoning_effort` when this is set, so without it the
-      // thinking UI would be a lie. Every family accepts it; models that do not
-      // think ignore it rather than rejecting it.
+      // thinking UI would be a lie. Levels a model does not accept are removed
+      // by thinkingLevelMap instead.
       supportsReasoningEffort: true,
       thinkingFormat: "openai" as const,
       // Several upstreams behind this route reject the `developer` role pi sends
@@ -383,19 +394,16 @@ function compatFor(id: string, api: Api) {
 /**
  * Fetches the catalog.
  *
- * Note: this endpoint is PUBLIC. It returns the full model list with HTTP 200
- * even when the API key is missing or invalid, so a successful fetch proves
+ * Note: these endpoints are PUBLIC. They return the full model list with HTTP
+ * 200 even when the API key is missing or invalid, so a successful fetch proves
  * nothing about credentials. `verifyApiKey` exists for that reason.
  */
 export async function fetchModels(
   signal?: AbortSignal,
+  url: string = MODELS_URL,
 ): Promise<RemoteModel[]> {
-  // No auth header: the catalog is public, and the key now comes from pi's
-  // credential store rather than this process's environment.
-  const res = await fetch(`${openaiBaseUrl()}/models`, { signal });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  const payload = (await res.json()) as { data?: RemoteModel[] };
-  return payload.data ?? [];
+  const catalog = await fetchCatalog(url, signal);
+  return catalog.models;
 }
 
 export type KeyCheck =
@@ -476,9 +484,13 @@ interface PlanError {
 /**
  * Reads a Command Code error payload out of a pi assistant message. pi stores
  * the upstream error text on `errorMessage`; we only need to pattern-match it.
+ *
+ * `plan` is the catalog's minimum plan for the model that failed, when known,
+ * so a plan error can name the tier instead of pointing at the pricing page.
  */
 export function classifyProviderError(
   errorMessage: string | undefined,
+  hints: { plan?: string } = {},
 ): PlanError | null {
   if (!errorMessage) return null;
   // 401 from the gateway: the key is missing, rotated or revoked. This is the
@@ -496,7 +508,9 @@ export function classifyProviderError(
     return {
       code: "MODEL_NOT_IN_PLAN",
       message:
-        "This model is not included in your Command Code plan. Upgrade at https://commandcode.ai/pricing, or pick another model — OpenRouter/DeepSeek models work on every tier.",
+        `This model is not included in your Command Code plan${
+          hints.plan ? ` (it needs ${hints.plan})` : ""
+        }. Upgrade at https://commandcode.ai/pricing, or pick another model — the open-source families work on every tier.`,
     };
   }
   if (/upgrade_required/i.test(errorMessage)) {
@@ -516,118 +530,44 @@ export function classifyProviderError(
   return null;
 }
 
+/** Reads `provider` off any agent message without assuming its shape. */
+function providerOf(message: unknown): string | undefined {
+  const provider = (message as { provider?: unknown }).provider;
+  return typeof provider === "string" ? provider : undefined;
+}
+
+/** Everything the commands and the status line read, updated per registration. */
+interface Runtime {
+  source: "network" | "cache";
+  catalog: Catalog;
+  warning?: string;
+  /** Models after ZDR filtering. */
+  models: RemoteModel[];
+  zdrHidden: number;
+  skipListed: number;
+  wires: Record<string, number>;
+  unpriced: number;
+  bundledPriced: number;
+  overridden: number;
+  routing: Routing;
+  lastRequest?: LastRequest;
+  requestStartedAt?: number;
+  auth: "configured" | "missing";
+}
+
 export default async function (pi: ExtensionAPI) {
+  const env = process.env;
   // Respect pi's abort signal so a slow/unreachable network can't hang startup.
-  const timeoutMs = positiveIntFromEnv(
-    process.env.COMMANDCODE_TIMEOUT_MS,
-    15000,
-  );
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  const signal = controller.signal;
+  const timeoutMs = positiveIntFromEnv(env.COMMANDCODE_TIMEOUT_MS, 15000);
+  const zdr = zdrEnabled(env);
+  const skip = zdrSkipList(env);
+  const maxTokens = positiveIntFromEnv(env.COMMANDCODE_MAX_TOKENS, DEFAULT_MAX_TOKENS);
+  const costs = parseRateOverrides(env.COMMANDCODE_RATES);
+  const cacheFile = cachePath(env);
+  const routingFile = routingPath(env);
 
-  const zdr = zdrEnabled();
+  const loaded = readRouting(routingFile);
 
-  // A catalog failure must not break pi startup, but it must be visible: the
-  // user gets "no models" otherwise, with no clue why.
-  const reportCatalogFailure = (
-    pi: ExtensionAPI,
-    reason: string,
-  ): void => {
-    console.error(`[command-code] ${reason}`);
-    pi.on("session_start", (_event, ctx) => {
-      ctx.ui.notify(`Command Code: ${reason}`, "warning");
-    });
-  };
-
-  let models: RemoteModel[];
-  try {
-    models = await fetchModels(signal);
-  } catch (err) {
-    reportCatalogFailure(
-      pi,
-      `could not load the model list (${
-        err instanceof Error ? err.message : err
-      }). Check your network, or set COMMANDCODE_API_BASE_URL for a proxy.`,
-    );
-    return;
-  } finally {
-    clearTimeout(timer);
-  }
-
-  if (models.length === 0) {
-    reportCatalogFailure(pi, "the model catalog was empty; nothing registered.");
-    return;
-  }
-
-  if (zdr) {
-    const skip = zdrSkipList();
-    const before = models.length;
-    if (skip.size > 0) {
-      models = models.filter((m) => !skip.has(m.id));
-    }
-    const dropped = before - models.length;
-    if (dropped > 0) {
-      console.error(
-        `[command-code] ZDR on: hid ${dropped} model(s) listed in COMMANDCODE_ZDR_SKIP.`,
-      );
-    }
-  }
-
-  const maxTokens = positiveIntFromEnv(
-    process.env.COMMANDCODE_MAX_TOKENS,
-    DEFAULT_MAX_TOKENS,
-  );
-
-  const costs = parseRateOverrides(process.env.COMMANDCODE_RATES);
-  const priced = models.filter(
-    (m) => resolveCost(m.id, costs) !== NO_COST,
-  ).length;
-
-  if (costs.size > 0) {
-    const overridden = models.filter((m) => costs.has(m.id)).length;
-    const hasFallback = costs.has("*");
-    console.error(
-      `[command-code] COMMANDCODE_RATES overrides ${overridden} model(s)` +
-        `${hasFallback ? " plus a '*' fallback" : ""}; ` +
-        `${priced}/${models.length} model(s) have published rates.`,
-    );
-  }
-
-  // Flag any model that would report $0, so a silent cost gap is visible.
-  const unpriced = models.filter((m) => resolveCost(m.id, costs) === NO_COST);
-  if (unpriced.length > 0) {
-    console.error(
-      `[command-code] ${unpriced.length} model(s) have no published rate and will report $0 ` +
-        `(tokens still exact): ${unpriced.map((m) => m.id).join(", ")}`,
-    );
-  }
-
-  pi.registerProvider(
-    createProvider<Api>({
-      id: PROVIDER_ID,
-      name: PROVIDER_NAME,
-      // Native auth: `pi` then offers `/login command-code`, which stores the
-      // key in pi's credential store instead of relying on this process's
-      // environment. Env vars stay as the fallback, resolved per request, so a
-      // rotated key is picked up without restarting pi.
-      auth: {
-        apiKey: envApiKeyAuth("Command Code API key", [
-          ...API_KEY_ENV_VARS,
-        ]),
-      },
-      models: models.map((m) => toModel(m, maxTokens, costs, zdr)),
-      api: {
-        "anthropic-messages": anthropicMessagesApi(),
-        "openai-completions": openAICompletionsApi(),
-        "openai-responses": openAIResponsesApi(),
-      },
-    }),
-  );
-
-  // The catalog is public, so it proves nothing about credentials. Check once
-  // per process, at session start, instead of failing every request with 401.
-  // Headless runs have no UI, so the warning also goes to stderr there.
   const warn = (
     ctx: { hasUI: boolean; ui: { notify: (m: string, t: "warning") => void } },
     text: string,
@@ -636,12 +576,309 @@ export default async function (pi: ExtensionAPI) {
     if (ctx.hasUI) ctx.ui.notify(`Command Code: ${text}`, "warning");
   };
 
+  const notify = (
+    ctx: { hasUI: boolean; ui: { notify: (m: string, t: "info") => void } },
+    lines: string[],
+  ): void => {
+    const text = lines.join("\n");
+    console.error(`[command-code] ${text.replace(/\n/g, " | ")}`);
+    if (ctx.hasUI) ctx.ui.notify(text, "info");
+  };
+
+  const runtime: Runtime = {
+    source: "network",
+    catalog: { fetchedAt: Date.now(), models: [] },
+    models: [],
+    zdrHidden: 0,
+    skipListed: 0,
+    wires: {},
+    unpriced: 0,
+    bundledPriced: 0,
+    overridden: 0,
+    routing: loaded.routing,
+    auth: "missing",
+  };
+
+  /** Applies ZDR filtering and registers the models with pi. */
+  const register = (catalog: Catalog): void => {
+    let models = catalog.models;
+    const before = models.length;
+
+    if (zdr) {
+      const skipHidden = models.filter((m) => skip.has(m.id));
+      runtime.skipListed = skipHidden.length;
+      models = models.filter((m) => !skip.has(m.id));
+      const noZdr = models.filter((m) => m.zdr === false);
+      runtime.zdrHidden = noZdr.length;
+      models = models.filter((m) => m.zdr !== false);
+    } else {
+      runtime.skipListed = 0;
+      runtime.zdrHidden = 0;
+    }
+
+    if (before !== models.length) {
+      console.error(
+        `[command-code] ZDR on: hid ${before - models.length} model(s) ` +
+          `(${runtime.zdrHidden} without a ZDR upstream, ${runtime.skipListed} from COMMANDCODE_ZDR_SKIP).`,
+      );
+    }
+
+    const wires: Record<string, number> = {};
+    let unpriced = 0;
+    let bundledPriced = 0;
+    let overridden = 0;
+    const built = models.map((m) => {
+      const api = apiForModel(m, runtime.routing[m.id]);
+      wires[api] = (wires[api] ?? 0) + 1;
+      if (!m.pricing && !costs.has(m.id) && !costs.has("*")) unpriced += 1;
+      else if (!m.pricing && costs.has(m.id)) overridden += 1;
+      else if (!m.pricing) bundledPriced += 1;
+      return toModel(m, maxTokens, costs, zdr, { wire: runtime.routing[m.id] });
+    });
+
+    runtime.models = models;
+    runtime.wires = wires;
+    runtime.unpriced = unpriced;
+    runtime.bundledPriced = bundledPriced;
+    runtime.overridden = overridden;
+    runtime.catalog = catalog;
+
+    pi.registerProvider(
+      createProvider<Api>({
+        id: PROVIDER_ID,
+        name: PROVIDER_NAME,
+        // Native auth: `pi` then offers `/login command-code`, which stores the
+        // key in pi's credential store. Env vars stay as the fallback, resolved
+        // per request, and the CLI's own auth file is read last so an existing
+        // `cmd` login works without copying the key.
+        auth: { apiKey: commandCodeAuth() },
+        models: built,
+        api: {
+          "anthropic-messages": withPeakPricing(anthropicMessagesApi()),
+          "openai-completions": withPeakPricing(openAICompletionsApi()),
+          "openai-responses": withPeakPricing(openAIResponsesApi()),
+        },
+      }),
+    );
+
+    // Flag any model that would report $0, so a silent cost gap is visible.
+    const unpricedIds = models
+      .filter((m) => !m.pricing && !costs.has(m.id) && !costs.has("*"))
+      .map((m) => m.id);
+    if (unpricedIds.length > 0) {
+      console.error(
+        `[command-code] ${unpricedIds.length} model(s) have no published rate and will report $0 ` +
+          `(tokens still exact): ${unpricedIds.join(", ")}`,
+      );
+    }
+  };
+
+  /** Auth is only set on session_start, and commands can run before it. */
+  const syncAuth = (ctx: {
+    modelRegistry: { getProviderAuthStatus: (id: string) => { configured: boolean } };
+  }): void => {
+    runtime.auth = ctx.modelRegistry.getProviderAuthStatus(PROVIDER_ID).configured
+      ? "configured"
+      : "missing";
+  };
+
+  const stateSnapshot = (): CatalogState => ({
+    provider: PROVIDER_NAME,
+    packageVersion: PACKAGE_VERSION,
+    source: runtime.source,
+    catalogVersion: runtime.catalog.catalogVersion,
+    modelCount: runtime.models.length,
+    fetchedAt: runtime.catalog.fetchedAt,
+    cacheFile,
+    refreshAfterMs: runtime.catalog.refreshAfterMs ?? 15 * 60 * 1000,
+    warning: runtime.warning ?? loaded.warning,
+    zdr,
+    zdrHidden: runtime.zdrHidden,
+    overrideCount: Object.keys(runtime.routing).length,
+    auth: runtime.auth,
+    unpriced: runtime.unpriced,
+    wires: runtime.wires,
+    lastRequest: runtime.lastRequest,
+  });
+
+  /** Network first, cache second. Undefined means nothing usable. */
+  const load = async (): Promise<{ catalog: Catalog; source: "network" | "cache"; warning?: string } | undefined> => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const catalog = await fetchCatalog(MODELS_URL, controller.signal);
+      if (catalog.models.length === 0) throw new Error("the catalog was empty");
+      // A cache we cannot write must not throw away a catalog we already have.
+      try {
+        writeCache(cacheFile, catalog);
+      } catch (err) {
+        console.error(
+          `[command-code] could not write ${cacheFile}: ${err instanceof Error ? err.message : err}. ` +
+            "Models are live for this session; the next start will have no cache.",
+        );
+      }
+      return { catalog, source: "network" };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      const cached = readCache(cacheFile);
+      if (!cached) {
+        reportCatalogFailure(
+          pi,
+          `could not load the model list (${reason}) and ${cacheFile} has no usable copy. ` +
+            "Check your network, or set COMMANDCODE_API_BASE_URL for a proxy.",
+        );
+        return undefined;
+      }
+      return {
+        catalog: cached,
+        source: "cache",
+        warning: `catalog refresh failed (${reason}); using the cache from ${new Date(cached.fetchedAt).toISOString()}`,
+      };
+    } finally {
+      clearTimeout(timer);
+    }
+  };
+
+  const first = await load();
+  if (!first) return;
+
+  runtime.source = first.source;
+  runtime.warning = first.warning;
+  register(first.catalog);
+  if (first.warning) console.error(`[command-code] ${first.warning}`);
+
+  const commandsAvailable = typeof pi.registerCommand === "function";
+
+  if (commandsAvailable) {
+    pi.registerCommand("commandcode-refresh", {
+      description: "Re-fetch the Command Code model catalog",
+      handler: async (_args, ctx) => {
+        const fresh = await load();
+        if (!fresh) {
+          notify(ctx, [
+            `Refresh failed; still showing ${runtime.models.length} model(s) from ${runtime.source}.`,
+          ]);
+          return;
+        }
+        runtime.source = fresh.source;
+        runtime.warning = fresh.warning;
+        register(fresh.catalog);
+        notify(ctx, formatStatus(stateSnapshot()));
+      },
+    });
+
+    pi.registerCommand("commandcode-status", {
+      description: "Show Command Code catalog, auth and routing state",
+      handler: async (_args, ctx) => {
+        syncAuth(ctx);
+        notify(ctx, formatStatus(stateSnapshot()));
+      },
+    });
+
+    pi.registerCommand("commandcode-diagnostics", {
+      description: "Print a redacted Command Code support report",
+      handler: async (_args, ctx) => {
+        syncAuth(ctx);
+        notify(
+          ctx,
+          formatDiagnostics({
+            state: stateSnapshot(),
+            nodeVersion: process.version,
+            platform: `${process.platform}/${process.arch}`,
+            apiBase: API_ROOT,
+            bundledPriced: runtime.bundledPriced,
+            overridden: runtime.overridden,
+            skipListed: runtime.skipListed,
+            peakPricing: (process.env.COMMANDCODE_PEAK_PRICING ?? "").trim() !== "0",
+          }),
+        );
+      },
+    });
+
+    pi.registerCommand("commandcode-quota", {
+      description: "Show Command Code credits, plan and usage windows",
+      handler: async (args, ctx) => {
+        const key = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER_ID);
+        if (!key) {
+          warn(
+            ctx,
+            "no API key. Run /login command-code, or set COMMANDCODE_API_KEY.",
+          );
+          return;
+        }
+        if (args.trim() === "json") {
+          notify(ctx, ["(json)", JSON.stringify(await fetchQuota({ apiKey: key, apiRoot: API_ROOT }), null, 2)]);
+          return;
+        }
+        const report = await fetchQuota({ apiKey: key, apiRoot: API_ROOT });
+        notify(ctx, formatQuota(report));
+      },
+    });
+
+    pi.registerCommand("commandcode-endpoint", {
+      description: "Pin a model to a wire: auto, chat-completions, responses or messages",
+      handler: async (args, ctx) => {
+        const parsed = parseEndpointArgs(args);
+        if (!parsed.ok) {
+          notify(ctx, [parsed.message]);
+          return;
+        }
+        const model = runtime.models.find((m) => m.id === parsed.modelId);
+        if (!model) {
+          notify(ctx, [
+            `Unknown model "${parsed.modelId}". Use the exact catalog id without the command-code/ prefix (see /commandcode-status).`,
+          ]);
+          return;
+        }
+        if (apiForModel(model, parsed.wire) === "anthropic-messages" && parsed.wire !== "auto") {
+          notify(ctx, [
+            `${parsed.modelId} answers on the Anthropic messages wire; that is not one of the OpenAI-shaped overrides. Use auto to restore catalog routing.`,
+          ]);
+          return;
+        }
+        runtime.routing = applyRouting(runtime.routing, model.id, parsed.wire);
+        try {
+          writeRouting(routingFile, runtime.routing);
+        } catch (err) {
+          warn(ctx, `could not write ${routingFile}: ${err instanceof Error ? err.message : err}`);
+        }
+        register(runtime.catalog);
+        notify(ctx, [
+          `${parsed.modelId} -> ${parsed.wire === "auto" ? "catalog routing" : parsed.wire}`,
+          `Catalog default for this model: ${wireLabel(apiForModel(model))}`,
+        ]);
+      },
+    });
+  }
+
+  // The catalog is public, so it proves nothing about credentials. Check once
+  // per process, at session start, instead of failing every request with 401.
+  // Headless runs have no UI, so the warning also goes to stderr there.
   let authChecked = false;
   pi.on("session_start", async (_event, ctx) => {
+    const configured =
+      ctx.modelRegistry.getProviderAuthStatus(PROVIDER_ID).configured;
+    runtime.auth = configured ? "configured" : "missing";
+
+    // A stale cache is refreshed in the background: startup already has models,
+    // so the user is never waiting on the network a second time.
+    if (cacheIsStale(runtime.catalog)) {
+      void (async () => {
+        const fresh = await load();
+        if (!fresh || fresh.catalog.catalogVersion === runtime.catalog.catalogVersion) return;
+        runtime.source = fresh.source;
+        runtime.warning = fresh.warning;
+        register(fresh.catalog);
+        console.error(
+          `[command-code] catalog refreshed in the background (${runtime.models.length} models).`,
+        );
+      })();
+    }
+
     if (authChecked) return;
     authChecked = true;
 
-    if (!ctx.modelRegistry.getProviderAuthStatus(PROVIDER_ID).configured) {
+    if (!configured) {
       warn(
         ctx,
         "no API key. Run /login command-code, or set COMMANDCODE_API_KEY.",
@@ -659,20 +896,35 @@ export default async function (pi: ExtensionAPI) {
     }
   });
 
+  pi.on("message_start", (event) => {
+    if (providerOf(event.message) === PROVIDER_ID) {
+      runtime.requestStartedAt = Date.now();
+    }
+  });
+
   // Turn opaque upstream errors into actionable ones. Plan gating, missing API
   // access and ZDR gaps all surface as bare status codes otherwise.
   pi.on("message_end", (event) => {
     const message = event.message;
     if (message.role !== "assistant") return;
-    if (message.stopReason !== "error") return;
-    if (
-      message.provider !== PROVIDER_ID &&
-      (message as { provider?: string }).provider !== PROVIDER_ID
-    ) {
-      return;
-    }
+    if (message.provider !== PROVIDER_ID) return;
 
-    const hint = classifyProviderError(message.errorMessage);
+    const started = runtime.requestStartedAt;
+    runtime.requestStartedAt = undefined;
+    const hint = classifyProviderError(
+      message.stopReason === "error" ? message.errorMessage : undefined,
+      { plan: planRequirement(runtime.models.find((m) => m.id === message.model)?.minimumPlan) },
+    );
+
+    runtime.lastRequest = {
+      model: message.model,
+      api: message.api,
+      at: Date.now(),
+      outcome: message.stopReason === "error" ? (hint?.code ?? "error") : message.stopReason,
+      latencyMs: started === undefined ? undefined : Date.now() - started,
+    };
+
+    if (message.stopReason !== "error") return;
     if (!hint) return;
 
     return {
@@ -681,5 +933,13 @@ export default async function (pi: ExtensionAPI) {
         errorMessage: `${message.errorMessage}\n\n[command-code] ${hint.message}`,
       },
     };
+  });
+}
+
+/** Kept out of the main flow so a startup failure has one path. */
+function reportCatalogFailure(pi: ExtensionAPI, reason: string): void {
+  console.error(`[command-code] ${reason}`);
+  pi.on("session_start", (_event, ctx) => {
+    ctx.ui.notify(`Command Code: ${reason}`, "warning");
   });
 }

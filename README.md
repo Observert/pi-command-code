@@ -6,13 +6,16 @@ One provider, the whole Command Code catalog — Claude, GPT, Gemini, DeepSeek, 
 
 ## Features
 
-- **The whole catalog, nothing hardcoded.** 94 models today, discovered from `/provider/v1/models` at startup.
-- **Native pi provider.** `/login command-code` stores the key in pi's credential store; `COMMANDCODE_API_KEY`, `CMD_API_KEY` and `COMMAND_CODE_API_KEY` work as env fallbacks.
-- **The right wire per model.** Catalog-driven routing to Anthropic Messages, OpenAI Responses or Chat Completions, with the per-model `baseUrl` each SDK expects.
-- **Thinking levels everywhere.** Every model registers as a reasoner, and Claude's adaptive-vs-legacy thinking shapes are handled per model.
-- **Cost tracking that works.** Bundled list rates for the whole catalog (94 models today), `COMMANDCODE_RATES` overrides and a `*` fallback.
-- **Zero data retention on request.** Opt-in header, a skip list for models without ZDR coverage, and no stale hardcoded blocklist.
-- **Plain-language errors.** `401`, plan gating and ZDR gaps are named, not passed through as bare status codes; catalog failures surface at session start.
+- **The whole catalog, nothing hardcoded.** 101 models today, discovered live from `/provider/v1/models` and its `?view=client` twin at startup.
+- **Capabilities read, not guessed.** Per-model `reasoningEfforts`, `inputModalities`, `maxOutputTokens`, `pricing` (including context tiers) and ZDR reach are taken from the same catalog the Command Code CLI reads.
+- **Native pi provider.** `/login command-code` stores the key in pi's credential store; `COMMANDCODE_API_KEY`, `CMD_API_KEY` and `COMMAND_CODE_API_KEY` work as env fallbacks, and the CLI's own `~/.commandcode/auth.json` is read last.
+- **The right wire per model.** Catalog-driven routing to Anthropic Messages, OpenAI Responses or Chat Completions, with the per-model `baseUrl` each SDK expects — plus persistent per-model overrides.
+- **Thinking levels everywhere, exactly where they exist.** Every model registers as a reasoner with a per-model level map, so the picker never offers an effort the model rejects, and `xhigh`/`max` are available where upstream supports them.
+- **Cost tracking that works.** Live catalog prices first, bundled list rates as the fallback, `COMMANDCODE_RATES` overrides, request-size tiers, and DeepSeek peak hours applied per request.
+- **Survives being offline.** The last catalog is cached, so a network failure at startup still gives you the models you had.
+- **Five commands.** `/commandcode-refresh`, `-status`, `-diagnostics`, `-quota`, `-endpoint`.
+- **Zero data retention on request.** Opt-in header, and models the catalog marks as having no ZDR upstream are hidden instead of failing.
+- **Plain-language errors.** `401`, plan gating (naming the tier the model needs) and ZDR gaps are named, not passed through as bare status codes.
 - **No native dependencies.** Pure ESM and global `fetch`; macOS, Linux and Windows on Node 18+.
 
 ## Install
@@ -40,7 +43,9 @@ export COMMAND_CODE_API_KEY=your_key_here
 
 On Windows, use `setx COMMANDCODE_API_KEY "your_key_here"` (or your shell's equivalent).
 
-> **Plan requirement:** the Provider API needs a plan with API access — the [Provider plan](https://commandcode.ai/provider) ($15/mo pay-as-you-go) or GOAT / Pro / Max / Team. The $1 **Go** plan cannot use the API.
+Already logged into the Command Code CLI? This provider reads the key from its auth file too, in this order: `~/.commandcode/auth.json`, `<pi agent dir>/auth.json`, `~/.omp/agent/auth.json`. Accepted shapes are `{"apiKey": "user_..."}`, `{"command-code": {"type": "api", "key": "user_..."}}` and `{"commandcode": "user_..."}`. Nothing is copied or rewritten.
+
+> **Plan requirement:** the Provider API needs a plan with API access — the [Provider plan](https://commandcode.ai/provider) ($15/mo + $1.01 processing fee, pay-as-you-go at cost, credits roll over) or GOAT / Pro / Max / Team. The $1 **Go** plan cannot use the API. Claude Opus and Fable need Max on a subscription *or* the Provider plan.
 
 ## Usage
 
@@ -64,16 +69,39 @@ Browse what's available:
 pi --list-models command-code     # ids, context window, max out, thinking, images
 ```
 
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `/commandcode-refresh` | Re-fetch the catalog, rewrite the cache and re-register models without a reload. A failed refresh keeps the current list. |
+| `/commandcode-status` | Catalog source, version, model count, wire breakdown, auth state, ZDR, overrides, last request. |
+| `/commandcode-diagnostics` | A redacted support report safe to paste in public: versions, catalog version, pricing coverage, last request outcome. No prompts, no keys. |
+| `/commandcode-quota` | Credits, plan, billing period, 5-hour and weekly windows. Add `json` for the raw responses. |
+| `/commandcode-endpoint <model-id> <wire>` | Pin one model to `auto`, `chat-completions`, `responses` or `messages`. Choices survive refreshes and restarts. |
+
+`/commandcode-quota` reads Command Code's read-only account endpoints (`/alpha/whoami`, `/alpha/billing/credits`, `/alpha/billing/subscriptions`, `/alpha/usage/summary`) with the key you already stored. They are undocumented and may change; a section that cannot be read is reported as unavailable rather than shown as zero. They never generate text and say nothing about Provider API entitlement.
+
+## Catalog cache and offline behavior
+
+Models come from two public endpoints: `/provider/v1/models` (routing and context) and `/provider/v1/models?view=client` (capabilities, prices, plan, ZDR). Both are fetched at startup and joined by model id.
+
+The result is cached at `<pi agent dir>/command-code-catalog.json` (`~/.pi/agent/` by default). If the network is unreachable, the cached catalog is registered instead, with a warning naming the cache age — pi no longer starts with an empty model list. The cache is refreshed in the background once it is older than the server's `refreshAfterSeconds` hint, so a long session picks up new models on its own.
+
 ## Thinking levels
 
 Every model in the catalog registers as a reasoner, so pi offers thinking levels across the whole catalog, not just Claude:
 
 ```bash
-pi --provider command-code --model claude-sonnet-5:high
-pi --provider command-code --model gpt-6-astra:medium
+pi --provider command-code --model claude-sonnet-5-5:high
+pi --provider command-code --model gpt-6-astra:max
 ```
 
-Use pi's levels (`minimal` … `max`); `off` is always available. A catalog that reports `reasoning: false` for a model removes them. Without a `thinkingLevelMap`, pi clamps `xhigh` and `max` to `high` for the OpenAI-shaped families — see [Notes and limitations](#notes-and-limitations) to send the full range.
+Which levels appear comes from the model's `reasoningEfforts` in the catalog, mapped onto pi's `thinkingLevelMap`:
+
+- A level the model does not list maps to `null`, so the picker never offers it. This matters: pi sends `reasoning_effort` for any level it thinks is supported, and 14 catalog models (`deepseek/*`, `Kimi-K3*`, `zai-org/GLM-5.3`, `sakana/fugu-ultra`, …) reject `medium` with a `400`.
+- `xhigh` and `max` appear only when upstream lists them, which is the case for 36 models. No `models.json` override is needed any more.
+- A model that lists no `off` gets `off: null`: pi then sends no reasoning field at all when you pick `off`, rather than an effort the upstream rejects.
+- A model the catalog reports no efforts for keeps `reasoning: true` but maps every level to `null`, so it can still stream thinking blocks while offering only `off`.
 
 Claude needs one exception handled in code: Claude 5.x and 4.7+ reject `thinking.type: "enabled"` and require the adaptive shape, while `claude-haiku-4-5-20251001` rejects adaptive and needs the legacy one. This package sets `compat.forceAdaptiveThinking` per model, so both work with no config flag and no family allowlist.
 
@@ -85,11 +113,14 @@ Settings are environment variables, or `/login` for the key, so they work identi
 | --- | --- | --- |
 | `COMMANDCODE_API_KEY` | — | API key when you are not using `/login`. `CMD_API_KEY` and `COMMAND_CODE_API_KEY` are accepted too. |
 | `COMMANDCODE_ZDR` | off | Set to `1` to enforce zero data retention on every request. |
-| `COMMANDCODE_ZDR_SKIP` | — | Comma-separated model ids to hide while ZDR is on. |
-| `COMMANDCODE_MAX_TOKENS` | `32768` | Max output tokens per request. Raise it if responses truncate. |
-| `COMMANDCODE_RATES` | — | Override bundled per-model rates (USD per million tokens). See [Cost tracking](#cost-tracking). |
-| `COMMANDCODE_TIMEOUT_MS` | `15000` | Catalog fetch timeout at load. |
+| `COMMANDCODE_ZDR_SKIP` | — | Comma-separated model ids to hide while ZDR is on, beyond the ones the catalog already flags. |
+| `COMMANDCODE_MAX_TOKENS` | `32768` | Output-token floor for models that publish no cap. A published `maxOutputTokens` wins. |
+| `COMMANDCODE_RATES` | — | Override per-model rates (USD per million tokens). See [Cost tracking](#cost-tracking). |
+| `COMMANDCODE_PEAK_PRICING` | on | Set to `0` to report DeepSeek's flat off-peak rate at all hours. |
+| `COMMANDCODE_TIMEOUT_MS` | `15000` | Catalog fetch timeout at load and on refresh. |
 | `COMMANDCODE_API_BASE_URL` | `https://api.commandcode.ai` | Point at a gateway, proxy, or self-hosted deployment. |
+| `COMMANDCODE_MODELS_CACHE` | `<agent dir>/command-code-catalog.json` | Where the catalog cache is written. |
+| `COMMANDCODE_ROUTING_FILE` | `<agent dir>/commandcode-routing.json` | Where endpoint overrides are stored. |
 
 ## How it routes
 
@@ -128,10 +159,10 @@ Accepts `1`, `true`, `yes`, or `on`.
 
 ZDR is a **hard** guarantee, not a preference. If a model has no ZDR-capable upstream, Command Code **fails the request** with `422 cmd_zdr_no_providers` rather than quietly routing somewhere that retains data. That's the correct behavior — but it means a model that lacks coverage will fail the moment you pick it.
 
-**This package ships no hardcoded ZDR blocklist.** ZDR coverage grows as Command Code signs new upstream agreements, so a baked-in list would go stale and hide models that work fine. Instead:
+**ZDR is enforced from the catalog.** The catalog marks each model with whether a ZDR-capable upstream exists, and this package hides the ones that do not while ZDR is on (23 of 117 today, including some premium models). No hardcoded blocklist ships, because coverage changes as Command Code signs upstream agreements.
 
 - The error is detected and explained in plain language when it happens.
-- If you want to hide known-bad models up front, list them yourself:
+- If you want to hide more models up front, list them yourself:
 
 ```bash
 export COMMANDCODE_ZDR_SKIP="meta/muse-spark-1.3,Qwen/Qwen3.8-Flash"
@@ -143,26 +174,24 @@ Those models are then excluded from the catalog and the count is reported at sta
 
 ## Cost tracking
 
-Cost tracking works out of the box for **all 94 models**. Rates are bundled from Command Code's published pricing table, so pi shows real dollar figures on every response. Free-tier models record `$0` by design, and startup names any model the table has no row for.
+Cost tracking works out of the box for **every visible model** — all 101 today, including this month's releases. Prices come from the live catalog, three models are free by design (`$0`, not unknown), the bundled table covers anything the catalog stops pricing, and startup names any model that would otherwise report `$0` without a price.
 
-### Why rates are bundled rather than fetched
+### Where the numbers come from
 
-**Command Code does not report cost through its API.** Verified directly, not assumed:
+| Source | Wins over | Covers |
+| --- | --- | --- |
+| Live catalog `pricing` | everything | every visible model, including request-size tiers |
+| `COMMANDCODE_RATES` | the bundled table | models the catalog does not price |
+| Bundled `rates.ts` | zero | the whole catalog as of generation |
+| Zero | — | never invents a number |
 
-| Where cost might live | What it actually contains |
-| --- | --- |
-| `GET /provider/v1/models` | only `id, object, created, owned_by, name, context_length` |
-| Response **headers** | no billing headers at all |
-| OpenAI-shaped body | `id, object, created, model, choices, usage, system_fingerprint` |
-| Anthropic-shaped body | `model, id, type, role, content, ..., usage` |
-| Streaming final chunk | token usage only |
-| `/pricing`, `/costs`, `/usage` | `404` |
+Token counts come back in every response and are detailed — input, output, cached, reasoning and cache-creation tokens. pi computes cost locally as `rate_per_million × tokens ÷ 1,000,000` from the registered `cost` block, so the rates are what matter.
 
-Token counts **are** returned and are detailed — input, output, cached, reasoning and cache-creation tokens. pi does not read cost from providers anyway; it computes it locally as `rate_per_million × tokens ÷ 1,000,000` from the `cost` block registered per model. So cost works if rates are known, and Command Code publishes them in its [docs pricing table](https://commandcode.ai/docs/resources/pricing-limits) — just not over the API.
+The catalog reports 14 models with request-size tiers (a bigger context costs more per token). Those are registered as pi `cost.tiers`, so a long request is charged at the right tier instead of the smallest one.
 
-### Keeping rates fresh
+### Keeping the bundled table fresh
 
-Rates move (deals, free tiers, DeepSeek hourly peak/off-peak). The bundled table is generated and checked in, so you can refresh it any time.
+Rates move (deals, free tiers, DeepSeek hourly peak/off-peak). The bundled table is generated and checked in, and it is only the fallback — but keep it current anyway.
 
 From a checkout of this package:
 
@@ -189,7 +218,7 @@ export COMMANDCODE_RATES="claude-sonnet-5-5=2,10,0.1,2.5;*=1,2,0.1,1.25"
 
 Format: entries separated by `;` (or newlines), each `modelId=input,output[,cacheRead[,cacheWrite]]`, in **USD per million tokens**. `;` separates entries because `,` separates the rates within one.
 
-Precedence: **your overrides** → **bundled list rates** → **zero**. A model with no known rate reports `$0` rather than a fabricated number, and startup names it:
+Precedence: **catalog price** → **your overrides** → **bundled list rates** → **zero**. A model with no known rate reports `$0` rather than a fabricated number, and startup names it:
 
 ```text
 [command-code] 1 model(s) have no published rate and will report $0 (tokens still exact): vendor/new-model
@@ -199,7 +228,7 @@ Malformed entries are skipped rather than thrown, so a typo can never stop pi fr
 
 One caveat: these are published list rates. A given request can cost slightly less, because Command Code routes open-source models across multiple upstreams and bills the mean per-provider price. Your [Usage](https://commandcode.ai/usage) page remains the source of truth, especially under ZDR where pass-through rates can differ.
 
-DeepSeek models are billed peak/off-peak. The bundled figures are the **off-peak** price the pricing page shows (~17h/day), so a request during 01:00–04:00 or 06:00–10:00 UTC on a weekday costs roughly double what pi reports. Weekends are off-peak all day.
+DeepSeek peak hours are applied per request, not baked into the rate. Five ids — `deepseek/deepseek-v4-pro`, `-v4-flash`, `-v4-flash-vision-exp`, `-v4.1-flash`, `-v4.1-flash-fast` — bill at **2x** during 01:00–04:00 and 06:00–10:00 UTC, Monday to Friday, and at the published rate the other 17 hours a day plus all weekend. pi's own cost multiply cannot vary by clock, so the finished response's usage is scaled instead: the number you see matches the window. `COMMANDCODE_PEAK_PRICING=0` restores the flat rate.
 
 ## Errors you might see
 
@@ -219,30 +248,33 @@ This package checks pi's auth status and verifies the key with a real (cheap) re
 
 ## Compatibility
 
-- **pi:** 0.86 or newer. Registration uses the native `Provider` API (`createProvider` from `@earendil-works/pi-ai`), which is what gives `/login` and stored credentials.
-- **OS:** macOS, Linux, Windows. Pure ESM and global `fetch` — no native modules, no shell commands, no filesystem paths, no path separators.
+- **pi:** 0.86 or newer. Registration uses the native `Provider` API (`createProvider` from `@earendil-works/pi-ai`), which is what gives `/login` and stored credentials. Verified against pi-ai 1.4. A host too old to know `thinkingLevelMap` or `cost.tiers` ignores those fields and falls back to its own defaults, so nothing breaks — you just lose per-model effort filtering and tiered cost.
+- **OS:** macOS, Linux, Windows. Pure ESM and global `fetch` — no native modules, no shell commands, and all paths go through `node:path` so separators never matter.
 - **Node:** 18 or newer (pi's own minimum). `engines` is set accordingly.
 - **Models:** the catalog is discovered at runtime, so this package does not need updating when Command Code adds models.
 
 ## Notes and limitations
 
-- **Cost is a published list rate, not a billed amount.** Bundled for all 94 models; override with `COMMANDCODE_RATES`. If the API ever returns per-model `pricing`, that value wins over both. See [Cost tracking](#cost-tracking).
-- **`maxTokens` is `32768` by default.** The catalog does not report output caps today, so this is a conservative floor; `max_output_tokens` is honoured as soon as the API sends it. Raise the floor with `COMMANDCODE_MAX_TOKENS`. Context window comes from the catalog's `context_length` (200K fallback).
-- **Every model registers as reasoning**, which is what enables thinking levels; a catalog `reasoning: false` overrides it. Non-Claude families set `compat.supportsReasoningEffort`, so pi actually sends `reasoning_effort` — without it the thinking UI would be a lie. A catalog that omits it keeps the default. See [Thinking levels](#thinking-levels).
-- **Thinking levels above `high` need an override.** No `thinkingLevelMap` is registered, so pi clamps `xhigh` and `max` to `high` for the OpenAI-shaped families. To send the full range, add a `modelOverrides` entry in `~/.pi/agent/models.json` with a `thinkingLevelMap` for that model id.
+- **Cost is a published list rate, not a billed amount.** The catalog's price wins, then `COMMANDCODE_RATES`, then the bundled table. Your [Usage](https://commandcode.ai/usage) page remains authoritative, especially under ZDR where pass-through rates can differ.
+- **`maxTokens` follows the catalog.** A published `maxOutputTokens` is used and clamped by the context window; the rest fall back to `COMMANDCODE_MAX_TOKENS` (32768). Eight models publish caps between 131k and 262k, and those were being truncated at 32k before. Context window comes from `context_length` (200K fallback).
+- **Every model registers as reasoning**, which is what enables thinking levels; a catalog `reasoning: false` overrides it. Non-Claude families set `compat.supportsReasoningEffort`, so pi actually sends `reasoning_effort` — without it the thinking UI would be a lie. See [Thinking levels](#thinking-levels).
+- **Level support is per model.** A model that rejects an effort is not offered it. An unmapped model (one the catalog does not describe) keeps pi's defaults.
+- **Costs come from the catalog first**, which is what `/commandcode-diagnostics` reports. `COMMANDCODE_RATES` fills in models the catalog does not price, so negotiated or ZDR rates override the bundled table rather than a live catalog price.
 - **Claude thinking uses the adaptive shape.** Claude 5.x and 4.7+ reject `thinking.type: "enabled"`, so every Claude model except `claude-haiku-4-5-20251001` sets `compat.forceAdaptiveThinking`. That rules out a family allowlist: `claude-haiku-5-5` also rejects the legacy shape, while the 4.5 haiku rejects adaptive.
-- **Text and images.** Image input is enabled by default and narrowed by the catalog's `modalities` when it is reported; every family accepted an image when probed.
-- If the catalog fetch fails, the provider registers nothing and says so at session start rather than blocking pi startup. Fix the cause and `/reload`.
+- **1-hour cache writes are costed at the 5-minute rate.** The catalog publishes a separate `cacheWrite1hCost` (2x on Claude), but pi's `cost` block has one `cacheWrite` rate, so the 1h surcharge is not applied. Requests that use 1h retention report slightly low.
+- **Decision models are not chat models.** `typesafe/jev` and its pinned `typesafe/jev-1.14.0` are documented by Command Code but are not in `/provider/v1/models` and never stream: they answer on a separate `POST /provider/v1/systemone` endpoint with a state-plus-typed-questions request and return probabilities. This provider registers only what the chat catalog lists, so Jev does not appear in the picker.
+- **Text and images follow the catalog.** 21 visible models are text-only and are registered that way, so an image is never sent to a model that will `400` on it. Unknown models default to text-only.
+- **A cold start with no network registers nothing.** The cached catalog covers the normal offline case; with no cache at all the provider says so at session start rather than blocking pi startup. Fix the cause and `/commandcode-refresh`.
 
 ## Development
 
 ```bash
 npm install
-npm test        # 31 tests
+npm test        # 58 tests
 npm run typecheck
 ```
 
-Tests cover the routing rules that make this package work (catalog endpoints before id prefix, the three API shapes, the two baseUrls staying distinct, the `/v1/v1` regression), registration with native auth, cross-platform config parsing, ZDR opt-in handling, cost-rate parsing and precedence (including catalog pricing winning), and error classification.
+Tests cover the routing rules that make this package work (catalog endpoints before id prefix, the three API shapes, the two baseUrls staying distinct, the `/v1/v1` regression), capability mapping (effort lists to level maps, published output caps, context tiers, text-only models), catalog merging and the offline cache, endpoint-override persistence, DeepSeek peak windows, auth-file shapes, command output, plan-gating hints, registration with native auth, the package version staying in step with `package.json`, and error classification.
 
 ## License
 

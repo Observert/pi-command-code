@@ -15,5 +15,5 @@
     "noFallthroughCasesInSwitch": true,
     "isolatedModules": true
   },
-  "include": ["index.ts", "index.test.ts"]
+  "include": ["*.ts"]
 }

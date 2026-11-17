@@ -1,6 +1,6 @@
 {
   "name": "pi-command-code",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Command Code Provider API for Pi — every top model (Claude, GPT, Gemini, DeepSeek, Kimi, GLM, Qwen, Grok & more) behind one OpenAI- or Anthropic-compatible endpoint, with the live model catalog discovered automatically at startup.",
   "type": "module",
   "keywords": [
@@ -32,6 +32,13 @@
   "homepage": "https://github.com/Observert/pi-command-code#readme",
   "files": [
     "index.ts",
+    "catalog.ts",
+    "capabilities.ts",
+    "auth.ts",
+    "routing.ts",
+    "quota.ts",
+    "commands.ts",
+    "peak.ts",
     "rates.ts",
     "scripts/refresh-rates.mjs",
     "README.md",

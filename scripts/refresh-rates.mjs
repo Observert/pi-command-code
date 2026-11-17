@@ -200,4 +200,11 @@ async function main() {
   console.error(`wrote ${OUT} (${entries.length} models)`);
 }
 
-await main();
+// Exit 2 separates "could not check" from "stale", so CI can tell a network
+// problem from real drift instead of reporting a false failure.
+try {
+  await main();
+} catch (err) {
+  console.error(`could not check rates: ${err instanceof Error ? err.message : err}`);
+  process.exit(2);
+}

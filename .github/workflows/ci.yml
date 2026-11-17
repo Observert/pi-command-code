@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: npm ci
+      # Tests import the extension, so a type error surfaces here; the explicit
+      # typecheck also covers files no test touches.
+      - run: npm run typecheck
+      - run: npm test
+      # The bundled rate table is only a fallback now, but drift is silent
+      # otherwise. Exit 2 means the check could not run (network), which is a
+      # warning rather than a failure so a bad runner is not mistaken for drift.
+      - name: rates.ts is current
+        run: |
+          code=0
+          node scripts/refresh-rates.mjs --check || code=$?
+          if [ "$code" -eq 2 ]; then
+            echo "::warning::rates could not be checked (network); skipping"
+            exit 0
+          fi
+          exit "$code"
